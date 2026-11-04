@@ -5,29 +5,32 @@ A multimodal Agentic RAG demo for the research paper **Attention Is All You Need
 ## Architecture and runtime flow
 
 ```mermaid
-flowchart LR
-  Admin[Admin uploads PDF + selects access] --> API[FastAPI upload endpoint]
-  API --> Validate[PDF type, size, classification checks]
-  Validate --> Parse[Docling: selectable text, FAST tables, HybridChunker]
-  Parse -->|parse failure| Fallback[PyMuPDF + model-tokenizer fallback]
-  Parse --> Embed[Nomic Text document embeddings in batches]
-  Fallback --> Embed
-  Embed --> Neo[(Neo4j: Document + KnowledgeItem + vector/full-text indexes)]
-  Neo --> Links[HAS_ITEM + NEXT + optional semantic KG]
-  API --> Catalog[(SQLite document catalog, sessions, limits)]
-  User[Admin or Employee] --> UI[Streamlit chat]
-  UI --> Ask[FastAPI /ask: token, role, session, guardrails]
-  Ask --> Vector[Neo4j vector candidates with Cypher ACL]
-  Ask --> BM25[Neo4j full-text BM25 candidates with Cypher ACL]
-  Vector --> RRF[Deduplicate by chunk ID + RRF]
-  BM25 --> RRF
-  RRF --> Expand[Authorized graph expansion; optional CrossEncoder]
-  Expand --> Gate[Evidence sufficiency + injection checks]
-  Gate -->|supported evidence| LLM[Optional OpenAI-compatible answer API]
-  Gate -->|insufficient evidence| Abstain[Grounded abstention]
-  LLM --> Response[Answer + filename/page citations]
-  Abstain --> Response
-  Response --> UI
+flowchart TB
+  PDF[Transformer research PDF] --> Docling[Docling + HybridChunker]
+  Docling --> Text[Text chunks]
+  Docling --> Tables[Tables + structured JSON]
+  Docling --> Formulas[Formula items / optional LaTeX enrichment]
+  Docling --> Figures[Figure crops + captions]
+  Figures --> Gemini[Optional Gemini descriptions]
+  Text --> NomicText[Nomic Text embeddings]
+  Tables --> NomicText
+  Formulas --> NomicText
+  Gemini --> NomicText
+  Figures --> NomicVision[Nomic Vision embeddings]
+  NomicText --> Neo4j[Neo4j vector + BM25 + typed graph]
+  NomicVision --> Neo4j
+  Text --> Manifest[Per-item metadata and artifacts]
+  Tables --> Manifest
+  Formulas --> Manifest
+  Figures --> Manifest
+  User[User question] --> Planner[Agent query planner]
+  Planner --> Router[Text / table / figure / formula router]
+  Router --> Retrieval[Neo4j vector + BM25]
+  Retrieval --> ACL[Cypher role filter]
+  ACL --> RRF[RRF + graph expansion]
+  RRF --> Gate[Evidence and safety gate]
+  Gate --> LLM[Grounded answer model]
+  LLM --> Response[Answer + citations + media]
 ```
 
 1. Admin uploads PDFs through Streamlit. The backend checks file type, header, size, and the selected `Public` or `Admin-only` classification. The default is `Admin-only`.
@@ -62,7 +65,7 @@ $env:HF_HOME=(Resolve-Path data\model_cache).Path
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` if you do not already have a local `.env`. Set `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` and a long random `TOKEN_SECRET`. Set `DEMO_PASSWORD` to the shared demo password you want. To generate prose instead of a retrieval excerpt, configure an approved OpenAI-compatible `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL`. Never commit `.env` or uploaded customer documents.
+Copy `.env.example` to `.env` if you do not already have a local `.env`. Set `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` and a long random `TOKEN_SECRET`. Set `DEMO_PASSWORD` to the demo password you want. Configure an approved OpenAI-compatible `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` for query planning and grounded answer generation. Add `GEMINI_API_KEY` for figure descriptions (optional; captions are used otherwise). Set `DOCLING_ENABLE_FORMULA_ENRICHMENT=true` only when ready to test Docling's formula model. Never commit `.env` or uploaded documents.
 
 ## Run the application
 
