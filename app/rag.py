@@ -638,13 +638,16 @@ def ingest_file(path, classification='Admin-only', document_name=None, document_
         existing = get_document(name)
         document_id = (existing.get('document_id') if existing else None) or document_id or str(uuid.uuid4())
         try:
-            page_count, records = _extract_docling(path, name)
+            page_count, records = _extract_docling(path, name, document_id)
             parse_mode, parse_warning = 'docling-hybrid-chunker', None
         except Exception as parse_error:
             page_count, records = _fallback_text_records(path)
             parse_mode, parse_warning = 'pymupdf-tokenizer-fallback', type(parse_error).__name__
             if not records:
                 raise ValueError(f'Docling failed ({parse_warning}) and PyMuPDF found no selectable text')
+        records, artifact_summary = persist_extracted_records(
+            document_id, name, page_count, classification, roles, records
+        )
         semantic_graph = _extract_semantic_graph(path)
         rows = _prepare_graph_rows(name, document_id, classification, roles, records)
         count = _replace_graph_document(name, document_id, classification, roles, page_count, rows)
@@ -659,10 +662,19 @@ def ingest_file(path, classification='Admin-only', document_name=None, document_
             'name': name, 'document_id': document_id, 'classification': classification,
             'allowed_roles': roles, 'pages': page_count, 'chunks': count,
             'tables': sum(row['kind'] == 'table' for row in rows),
-            'images': sum(row['kind'] == 'image' for row in rows),
+            'figures': sum(row['kind'] == 'figure' for row in rows),
+            'formulas': sum(row['kind'] == 'formula' for row in rows),
+            'images': sum(row['kind'] == 'figure' for row in rows),
             'entities': semantic_counts['entities'], 'relations': semantic_counts['relations'],
+            'artifacts': artifact_summary.get('artifacts', {}),
+            'content_counts': artifact_summary.get('counts', {}),
             'parser': parse_mode, 'status': 'indexed',
         }
+        description_warnings = [
+            row.get('description_warning') for row in rows if row.get('description_warning')
+        ]
+        if description_warnings:
+            result['figure_description_warning'] = '; '.join(dict.fromkeys(description_warnings))
         if parse_warning:
             result['warning'] = f'Docling failed; indexed selectable text via PyMuPDF ({parse_warning})'
         if semantic_warning:
