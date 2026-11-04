@@ -972,9 +972,9 @@ def search(query, role, top_k=5, history=None, max_hops=None, content_types=None
             expanded += list(session.run(
                 "MATCH (seed:KnowledgeItem) WHERE seed.id IN $ids AND $role IN seed.allowed_roles "
                 "MATCH p=(seed)-[:NEXT|RELATED_ON_PAGE*1..2]-(neighbor:KnowledgeItem) "
-                "WHERE length(p)<=$hops AND $role IN neighbor.allowed_roles "
+                "WHERE length(p)<=$hops AND $role IN neighbor.allowed_roles AND neighbor.kind IN $kinds "
                 "RETURN DISTINCT neighbor ORDER BY neighbor.document,neighbor.page LIMIT 12",
-                ids=seeds, role=role, hops=hops,
+                ids=seeds, role=role, hops=hops, kinds=allowed_types,
             ))
             if DOCLING_GRAPH_TEMPLATE:
                 expanded += list(session.run(
@@ -983,9 +983,9 @@ def search(query, role, top_k=5, history=None, max_hops=None, content_types=None
                     "MATCH p=(anchor)-[:KG_RELATION*1..2]-(related:KGEntity) "
                     "WHERE $role IN related.allowed_roles AND all(r IN relationships(p) WHERE $role IN r.allowed_roles) "
                     "MATCH (neighbor:KnowledgeItem)-[:MENTIONS]->(related) "
-                    "WHERE $role IN neighbor.allowed_roles RETURN DISTINCT neighbor "
-                    "ORDER BY neighbor.document,neighbor.page LIMIT 12",
-                    ids=seeds, role=role,
+                    "WHERE $role IN neighbor.allowed_roles AND neighbor.kind IN $kinds "
+                    "RETURN DISTINCT neighbor ORDER BY neighbor.document,neighbor.page LIMIT 12",
+                    ids=seeds, role=role, kinds=allowed_types,
                 ))
         if debug_trace:
             debug_trace.add(
