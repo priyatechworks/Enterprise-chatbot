@@ -6,6 +6,7 @@ import json
 import os
 import re
 import uuid
+import time
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,7 @@ from app.storage import get_document, record_failure, upsert_document
 from app.metadata import persist_extracted_records
 from app.vision import describe_image
 from app.agent import plan_query
+from app.trace import RequestTrace
 
 _driver = None
 _neo4j_supports_search = False
@@ -749,32 +751,98 @@ def reciprocal_rank_fusion(vector_rows, keyword_rows, rrf_constant=60):
     return sorted(fused.values(), key=lambda item: item['rrf_score'], reverse=True)
 
 
-def search(query, role, top_k=5, history=None, max_hops=None, content_types=None):
+def _debug_item(row, rank=None, source=None):
+    """Return authorized evidence fields useful for understanding a retrieval result."""
+    node = row.get("node", row)
+    score = row.get("score")
+    return {
+        "rank": rank,
+        "retrieval_source": source,
+        "item_id": node.get("item_id") or node.get("id") or node.get("chunk_id"),
+        "document": node.get("document", ""),
+        "page": node.get("page"),
+        "content_type": node.get("content_type", node.get("kind", "text")),
+        "retrieval_score": round(float(score), 6) if score is not None else None,
+        "vector_rank": row.get("vector_rank"),
+        "vector_score": row.get("vector_score"),
+        "bm25_rank": row.get("bm25_rank"),
+        "bm25_score": row.get("bm25_score"),
+        "rrf_score": row.get("rrf_score"),
+        "final_score": row.get("score"),
+        "section": node.get("section", ""),
+        "caption": node.get("caption", ""),
+        "text": str(node.get("text", "")),
+        "latex": node.get("latex", ""),
+        "asset_path": node.get("asset_path", ""),
+        "file_path": node.get("file_path", node.get("asset_path", "")),
+        "table_json": node.get("table_json", ""),
+        "docling_ref": node.get("docling_ref", ""),
+        "graph_expanded": bool(node.get("graph_expanded", False)),
+    }
+
+
+def search(query, role, top_k=5, history=None, max_hops=None, content_types=None, debug_trace=None):
     allowed_types = list(dict.fromkeys(
         kind for kind in (content_types or ["text", "table", "figure", "formula"])
         if kind in {"text", "table", "figure", "formula"}
     )) or ["text"]
     database = driver()
+    embedding_started = time.perf_counter()
     query_vector = np.asarray(text_embeddings([query], query=True)[0], dtype=np.float32).tolist()
+    if debug_trace:
+        debug_trace.add(
+            "query_embedding", "Nomic Text embedding model", started=embedding_started,
+            details={"query": query, "model": TEXT_MODEL, "prefix": "search_query:", "dimension": len(query_vector)},
+            data={"query_vector_dimension": len(query_vector)},
+        )
     candidate_limit = max(RETRIEVAL_CANDIDATE_K, top_k)
     index_limit = candidate_limit * 5  # over-fetch to account for inaccessible hits before ACL filtering
     keyword_query = _lucene_query(query)
+    if debug_trace:
+        debug_trace.add(
+            "retrieval_parameters", "Neo4j vector + Lucene full-text search",
+            details={"role": role, "requested_content_types": allowed_types, "candidate_limit": candidate_limit,
+                     "index_limit": index_limit, "lucene_query": keyword_query, "top_k": top_k},
+        )
     with database.session(database=NEO4J_DATABASE) as session:
+        vector_started = time.perf_counter()
         vector_rows = _vector_query(session, query_vector, role, index_limit, candidate_limit, kinds=allowed_types)
+        if debug_trace:
+            debug_trace.add(
+                "vector_search", "Neo4j vector index: knowledge_embedding",
+                started=vector_started, details={"authorized_candidates": len(vector_rows), "role_filter_applied_before_return": True},
+                data={"items": [_debug_item(row, i + 1, "vector") for i, row in enumerate(vector_rows)]},
+            )
         keyword_rows = []
         restricted_vector = []
         restricted_keyword = []
         if keyword_query:
+            bm25_started = time.perf_counter()
             keyword_rows = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit, kinds=allowed_types)
+            if debug_trace:
+                debug_trace.add(
+                    "bm25_search", "Neo4j Lucene full-text index: knowledge_text",
+                    started=bm25_started, details={"authorized_candidates": len(keyword_rows), "lucene_query": keyword_query,
+                                                   "role_filter_applied_before_return": True},
+                    data={"items": [_debug_item(row, i + 1, "bm25") for i, row in enumerate(keyword_rows)]},
+                )
             # These denial probes return scores only; no restricted document text or name escapes Neo4j.
             restricted_keyword = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit, restricted=True, kinds=allowed_types)
         restricted_vector = _vector_query(session, query_vector, role, index_limit, candidate_limit, restricted=True, kinds=allowed_types)
 
+        fusion_started = time.perf_counter()
         ranked = reciprocal_rank_fusion(vector_rows, keyword_rows)
+        if debug_trace:
+            debug_trace.add(
+                "hybrid_fusion", "Reciprocal Rank Fusion (RRF)",
+                started=fusion_started, details={"unique_candidates_after_deduplication": len(ranked), "rrf_constant": 60},
+                data={"items": [_debug_item(item, i + 1, "vector+bm25 fusion") for i, item in enumerate(ranked)]},
+            )
         fused = {item['id']: item for item in ranked}
         seeds = [item['id'] for item in ranked[:min(top_k, 5)]]
         expanded = []
         hops = min(max_hops if max_hops is not None else GRAPH_MAX_HOPS, 3)
+        graph_started = time.perf_counter()
         if seeds and hops:
             expanded += list(session.run(
                 "MATCH (seed:KnowledgeItem) WHERE seed.id IN $ids AND $role IN seed.allowed_roles "
@@ -794,6 +862,15 @@ def search(query, role, top_k=5, history=None, max_hops=None, content_types=None
                     "ORDER BY neighbor.document,neighbor.page LIMIT 12",
                     ids=seeds, role=role,
                 ))
+        if debug_trace:
+            debug_trace.add(
+                "graph_expansion", "Neo4j NEXT / RELATED_ON_PAGE / optional KG traversal",
+                started=graph_started, details={"seed_items": seeds, "graph_hop_limit": hops,
+                                                "new_neighbor_records": len(expanded),
+                                                "only_authorized_neighbors_returned": True},
+                data={"items": [_debug_item(item["neighbor"], i + 1, "graph expansion")
+                                for i, item in enumerate(expanded)]},
+            )
         seen = set(fused)
         for result in expanded:
             node = result['neighbor']
@@ -814,31 +891,76 @@ def search(query, role, top_k=5, history=None, max_hops=None, content_types=None
                 }
                 seen.add(chunk_id)
         candidates = sorted(fused.values(), key=lambda item: item['rrf_score'], reverse=True)
+        rerank_started = time.perf_counter()
         # ACL was applied by Neo4j before text was returned; only these allowed rows are reranked.
         candidates = _rerank(query, candidates)
+        if debug_trace:
+            debug_trace.add(
+                "cross_encoder_rerank", "Optional Sentence Transformers CrossEncoder",
+                started=rerank_started, details={"enabled": CROSS_ENCODER_ENABLED,
+                                                  "candidate_count": len(candidates),
+                                                  "model": CROSS_ENCODER_MODEL if CROSS_ENCODER_ENABLED else None},
+                data={"items": [_debug_item(item, i + 1, "after rerank") for i, item in enumerate(candidates)]},
+            )
         denied = bool(restricted_vector or restricted_keyword)
-        return candidates[:top_k], denied
+        final_items = candidates[:top_k]
+        if debug_trace:
+            debug_trace.add(
+                "search_task_final", "Content-type-filtered retrieval result",
+                details={"returned": len(final_items), "top_k": top_k, "restricted_match": denied,
+                         "content_types": allowed_types},
+                data={"items": [_debug_item(item, i + 1, "final search result") for i, item in enumerate(final_items)]},
+            )
+        return final_items, denied
 
 
-def agentic_search(query, role, top_k=5, history=None):
-    """Plan up to four modality-specific searches and merge their authorized evidence."""
+def agentic_search(query, role, top_k=5, history=None, debug_trace=None):
+    """Plan bounded modality-specific searches and record why each item was retrieved."""
+    planning_started = time.perf_counter()
     plan = plan_query(query)
     tasks = plan.get("tasks", [])[:4]
+    if debug_trace:
+        debug_trace.add(
+            "query_plan", f"Agent query planner ({plan.get('planner', 'unknown')})",
+            started=planning_started,
+            details={"original_question": query, "task_count": len(tasks),
+                     "requested_types": plan.get("requested_types", [])},
+            data={"plan": plan},
+        )
     merged = {}
     denied = False
     task_trace = []
-    for task in tasks:
+    for task_index, task in enumerate(tasks, start=1):
         subquery = task.get("query") or query
         kinds = task.get("content_types") or ["text"]
-        hits, blocked = search(
-            subquery, role, top_k, history=history,
-            max_hops=min(GRAPH_MAX_HOPS, 2), content_types=kinds,
-        )
+        task_started = time.perf_counter()
+        if debug_trace:
+            debug_trace.add(
+                "retrieval_task_started", f"Agent task {task_index}/{len(tasks)}",
+                details={"subquery": subquery, "content_types": kinds},
+            )
+            hits, blocked = search(
+                subquery, role, top_k, history=history,
+                max_hops=min(GRAPH_MAX_HOPS, 2), content_types=kinds,
+                debug_trace=debug_trace,
+            )
+        else:
+            hits, blocked = search(
+                subquery, role, top_k, history=history,
+                max_hops=min(GRAPH_MAX_HOPS, 2), content_types=kinds,
+            )
         denied = denied or blocked
         task_trace.append({
             "query": subquery, "content_types": kinds,
             "hits": len(hits), "restricted_match": bool(blocked),
         })
+        if debug_trace:
+            debug_trace.add(
+                "retrieval_task_completed", f"Agent task {task_index}/{len(tasks)}",
+                started=task_started,
+                details={"authorized_hits": len(hits), "restricted_match": bool(blocked)},
+                data={"items": [_debug_item(hit, i + 1, "task result") for i, hit in enumerate(hits)]},
+            )
         for hit in hits:
             key = hit["id"]
             if key not in merged or hit.get("rrf_score", 0) > merged[key].get("rrf_score", 0):
@@ -846,6 +968,13 @@ def agentic_search(query, role, top_k=5, history=None):
     result = sorted(
         merged.values(), key=lambda item: item.get("rrf_score", 0), reverse=True
     )[:top_k]
+    if debug_trace:
+        debug_trace.add(
+            "agent_merge_final", "Agent merge and de-duplication",
+            details={"unique_items_before_top_k": len(merged), "returned": len(result),
+                     "top_k": top_k, "restricted_match": denied},
+            data={"items": [_debug_item(item, i + 1, "agent final result") for i, item in enumerate(result)]},
+        )
     return result, denied, {
         "rounds": len(tasks), "graph_hops": min(GRAPH_MAX_HOPS, 2),
         "planner": plan.get("planner", "heuristic"),
