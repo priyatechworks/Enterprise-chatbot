@@ -1,0 +1,42 @@
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-local-rag-change-this}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-local-rag-change-this}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - ./data/neo4j/data:/data
+      - ./data/neo4j/logs:/logs
+      - ./data/neo4j/import:/var/lib/neo4j/import
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p '$${NEO4J_PASSWORD}' 'RETURN 1' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    mem_limit: 3g
+  api:
+    build: .
+    command: uvicorn app.api:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    ports: ["8000:8000"]
+    volumes: ["./data:/app/data"]
+    env_file: [.env]
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+    depends_on:
+      neo4j: {condition: service_healthy}
+  ui:
+    build: .
+    command: streamlit run app/ui.py --server.address 0.0.0.0 --server.port 8501
+    restart: unless-stopped
+    ports: ["8501:8501"]
+    volumes: ["./data:/app/data"]
+    env_file: [.env]
+    depends_on: [api]

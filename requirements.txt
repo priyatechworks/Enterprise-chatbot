@@ -1,0 +1,22 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+streamlit==1.44.1
+PyMuPDF==1.25.5
+docling==2.145.0
+# Provides the installed-compatible Docling HybridChunker and HuggingFaceTokenizer APIs.
+docling-core[chunking,chunking-openai]==2.105.0
+docling-graph==1.9.1
+neo4j>=5.26,<7
+# CrossEncoder is included in sentence-transformers; Lucene BM25 is provided by Neo4j full-text search.
+sentence-transformers==4.1.0
+transformers>=4.45,<5
+einops>=0.8,<1
+hf_xet>=1.8,<2
+torch>=2.2
+Pillow>=10
+numpy>=1.26,<3
+requests>=2.34.2,<3
+python-dotenv==1.1.0
+python-multipart==0.0.20
+pytest==8.3.5
+httpx==0.28.1

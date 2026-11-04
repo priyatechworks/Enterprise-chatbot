@@ -1,0 +1,3 @@
+# Optional, separate LLM-as-judge evaluation dependencies. Keep out of the chatbot runtime.
+ragas>=0.4,<0.5
+openai>=1.0,<3

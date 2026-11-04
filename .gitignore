@@ -1,0 +1,15 @@
+__pycache__/
+.venv/
+.env
+*.sqlite3
+*.faiss
+data/rag_demo.sqlite3
+data/index/
+data/model_cache/
+data/assets/
+data/documents/
+data/neo4j/
+data/pip-cache/
+data/tmp/
+data/*.sqlite3*
+data/index/
