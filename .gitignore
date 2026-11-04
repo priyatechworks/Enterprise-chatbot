@@ -7,6 +7,7 @@ data/rag_demo.sqlite3
 data/index/
 data/model_cache/
 data/assets/
+data/extracted/
 data/documents/
 data/neo4j/
 data/pip-cache/
