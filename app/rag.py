@@ -19,7 +19,7 @@ from app.config import (
     DOC_GRAPH_PROVIDER, EMBEDDING_DIMENSION, GRAPH_MAX_HOPS, LLM_API_KEY,
     LLM_BASE_URL, LLM_MODEL, MANIFEST_PATH, MODEL_CACHE_DIR, NEO4J_DATABASE,
     NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER, RETRIEVAL_CANDIDATE_K,
-    RETRIEVAL_THRESHOLD, TEXT_MODEL, VISION_MODEL,
+    RETRIEVAL_THRESHOLD, TEXT_MODEL, VISION_MODEL, RAG_DEBUG_TRACE,
 )
 from app.storage import get_document, record_failure, upsert_document
 from app.metadata import persist_extracted_records
@@ -637,33 +637,142 @@ def _store_semantic_graph(name, document_id, roles, graph):
 def ingest_file(path, classification='Admin-only', document_name=None, document_id=None):
     path = Path(path)
     name = document_name or path.name
+    ingestion_trace = RequestTrace(enabled=True) if RAG_DEBUG_TRACE else None
+    ingestion_started = time.perf_counter()
+    if ingestion_trace:
+        ingestion_trace.add(
+            "ingestion_started", "PDF ingestion endpoint",
+            details={"filename": name, "classification": classification,
+                     "formula_enrichment_enabled": DOCLING_ENABLE_FORMULA_ENRICHMENT,
+                     "figure_extraction_enabled": DOCLING_EXTRACT_PICTURES,
+                     "ocr_enabled": DOCLING_ENABLE_OCR},
+        )
     try:
         if path.suffix.lower() != '.pdf' or not name.lower().endswith('.pdf'):
             raise ValueError('Only PDF files supported')
         roles = _policy_roles(classification)
         existing = get_document(name)
         document_id = (existing.get('document_id') if existing else None) or document_id or str(uuid.uuid4())
+        parse_started = time.perf_counter()
         try:
             page_count, records = _extract_docling(path, name, document_id)
             parse_mode, parse_warning = 'docling-hybrid-chunker', None
+            if ingestion_trace:
+                counts = {kind: sum(record.get("kind") == kind for record in records)
+                          for kind in ("text", "table", "formula", "figure")}
+                formula_items = [
+                    {"page": record.get("page"), "text": record.get("text", ""),
+                     "latex": record.get("latex", ""), "docling_ref": record.get("docling_ref", "")}
+                    for record in records if record.get("kind") == "formula"
+                ]
+                ingestion_trace.add(
+                    "docling_extraction", "Docling PDF converter + HybridChunker",
+                    started=parse_started,
+                    status="complete" if counts["formula"] else "warning",
+                    details={"pages": page_count, "record_counts": counts,
+                             "formula_enrichment_enabled": DOCLING_ENABLE_FORMULA_ENRICHMENT,
+                             "figure_extraction_enabled": DOCLING_EXTRACT_PICTURES,
+                             "ocr_enabled": DOCLING_ENABLE_OCR,
+                             "warning": None if counts["formula"] else
+                             "Docling returned no items labelled formula; inspect the formula model/configuration and extracted Docling JSON."},
+                    data={"records": [
+                        {"content_type": record.get("kind"), "page": record.get("page"),
+                         "section": record.get("section") or " > ".join(record.get("headings", [])),
+                         "text": record.get("text", ""), "latex": record.get("latex", ""),
+                         "caption": record.get("caption", ""),
+                         "asset_path": record.get("asset_path", ""),
+                         "docling_ref": record.get("docling_ref", ""),
+                         "structured_data": record.get("structured_data")}
+                        for record in records
+                    ], "formula_items": formula_items},
+                )
         except Exception as parse_error:
+            if ingestion_trace:
+                ingestion_trace.add(
+                    "docling_extraction", "Docling PDF converter + HybridChunker",
+                    started=parse_started, status="failed",
+                    details={"exception_type": type(parse_error).__name__,
+                             "exception_message": str(parse_error),
+                             "fallback": "PyMuPDF selectable-text extraction only"},
+                )
             page_count, records = _fallback_text_records(path)
             parse_mode, parse_warning = 'pymupdf-tokenizer-fallback', type(parse_error).__name__
+            if ingestion_trace:
+                ingestion_trace.add(
+                    "pymupdf_fallback", "PyMuPDF page text + tokenizer chunking",
+                    details={"record_count": len(records),
+                             "content_types": sorted({record.get("kind", "text") for record in records}),
+                             "limitation": "Fallback does not extract figures, structured tables or formulas"},
+                    data={"records": records},
+                )
             if not records:
                 raise ValueError(f'Docling failed ({parse_warning}) and PyMuPDF found no selectable text')
+
+        artifact_started = time.perf_counter()
         records, artifact_summary = persist_extracted_records(
             document_id, name, page_count, classification, roles, records
         )
+        if ingestion_trace:
+            ingestion_trace.add(
+                "local_artifact_persistence", "app.metadata.persist_extracted_records",
+                started=artifact_started,
+                details={"record_counts": artifact_summary.get("counts", {}),
+                         "document_id": document_id},
+                data={"artifact_paths": artifact_summary.get("artifacts", {}),
+                      "metadata_summary": artifact_summary,
+                      "items": [
+                          {"item_id": record.get("item_id"), "content_type": record.get("kind"),
+                           "page": record.get("page"), "file_path": record.get("file_path", ""),
+                           "asset_path": record.get("asset_path", ""),
+                           "latex": record.get("latex", ""), "text": record.get("text", "")}
+                          for record in records
+                      ]},
+            )
+
         semantic_graph = _extract_semantic_graph(path)
+        embedding_started = time.perf_counter()
         rows = _prepare_graph_rows(name, document_id, classification, roles, records)
+        if ingestion_trace:
+            ingestion_trace.add(
+                "embedding_generation", "Nomic Text and Nomic Vision embedding models",
+                started=embedding_started,
+                details={"indexed_items": len(rows),
+                         "content_counts": {kind: sum(row["kind"] == kind for row in rows)
+                                            for kind in ("text", "table", "formula", "figure")},
+                         "text_model": TEXT_MODEL, "vision_model": VISION_MODEL,
+                         "embedding_dimension": EMBEDDING_DIMENSION},
+                data={"items": [
+                    {"item_id": row["id"], "content_type": row["kind"], "page": row["page"],
+                     "embedding_dimension": len(row["embedding"]),
+                     "embedding_model": VISION_MODEL if row["kind"] == "figure" else TEXT_MODEL,
+                     "asset_path": row.get("asset_path", ""), "file_path": row.get("file_path", "")}
+                    for row in rows
+                ]},
+            )
+        graph_started = time.perf_counter()
         count = _replace_graph_document(name, document_id, classification, roles, page_count, rows)
+        if ingestion_trace:
+            ingestion_trace.add(
+                "neo4j_indexing", "Neo4j KnowledgeItem / Section graph + vector and full-text indexes",
+                started=graph_started,
+                details={"knowledge_items_written": count, "document_id": document_id,
+                         "database": NEO4J_DATABASE,
+                         "vector_index": "knowledge_embedding", "fulltext_index": "knowledge_text"},
+            )
         semantic_warning = None
         try:
             semantic_counts = _store_semantic_graph(name, document_id, roles, semantic_graph)
         except Exception as exc:
             semantic_counts = {'entities': 0, 'relations': 0}
             semantic_warning = f'Optional semantic graph storage failed ({type(exc).__name__}); document text remains indexed'
+        registry_started = time.perf_counter()
         upsert_document(name, page_count, count, roles, document_id, classification)
+        if ingestion_trace:
+            ingestion_trace.add(
+                "sqlite_document_registry", "app.storage.upsert_document",
+                started=registry_started,
+                details={"document": name, "document_id": document_id, "classification": classification},
+            )
         result = {
             'name': name, 'document_id': document_id, 'classification': classification,
             'allowed_roles': roles, 'pages': page_count, 'chunks': count,
@@ -674,6 +783,7 @@ def ingest_file(path, classification='Admin-only', document_name=None, document_
             'entities': semantic_counts['entities'], 'relations': semantic_counts['relations'],
             'artifacts': artifact_summary.get('artifacts', {}),
             'content_counts': artifact_summary.get('counts', {}),
+            'formula_enrichment_enabled': DOCLING_ENABLE_FORMULA_ENRICHMENT,
             'parser': parse_mode, 'status': 'indexed',
         }
         description_warnings = [
@@ -685,10 +795,25 @@ def ingest_file(path, classification='Admin-only', document_name=None, document_
             result['warning'] = f'Docling failed; indexed selectable text via PyMuPDF ({parse_warning})'
         if semantic_warning:
             result['warning'] = '; '.join(filter(None, [result.get('warning'), semantic_warning]))
+        if ingestion_trace:
+            ingestion_trace.add(
+                "ingestion_completed", "PDF ingestion pipeline",
+                started=ingestion_started,
+                details={"status": result["status"], "content_counts": result["content_counts"],
+                         "artifact_paths": result["artifacts"]},
+            )
+            result["debug_trace"] = ingestion_trace.events
         return result
     except Exception as exc:
+        if ingestion_trace:
+            ingestion_trace.add(
+                "ingestion_failed", "PDF ingestion pipeline", status="failed",
+                started=ingestion_started,
+                details={"exception_type": type(exc).__name__, "exception_message": str(exc)},
+            )
         record_failure(name, str(exc))
-        return {'name': name, 'status': 'failed', 'message': str(exc)}
+        return {'name': name, 'status': 'failed', 'message': str(exc),
+                'debug_trace': ingestion_trace.events if ingestion_trace else []}
 
 
 def ingest_many(paths, classification='Admin-only'):
