@@ -1,4 +1,5 @@
 import requests
+from pathlib import Path
 import streamlit as st
 
 st.set_page_config(page_title='Enterprise Graph RAG',page_icon='📚',layout='wide')
@@ -92,15 +93,75 @@ def show_sources(sources,headers):
 
 def show_debug_trace(events):
  if not events:return
- with st.expander('Developer trace · every retrieval step',expanded=True):
-  st.caption('Local debugging only. Includes retrieved text, scores, model/DB steps, file paths and timings. Review this before changing the UI to a normal chatbot.')
-  for index,event in enumerate(events,1):
-   duration=f" · {event['duration_ms']} ms" if event.get('duration_ms') is not None else ''
-   elapsed=f" · +{event.get('elapsed_from_request_start_ms',0)} ms"
-   st.markdown(f"**{index}. {event.get('stage','Stage')}**{duration}{elapsed}")
-   st.caption(f"{event.get('component','')} · {event.get('status','unknown')} · {event.get('timestamp','')}")
-   if event.get('details'):st.caption(str(event['details']))
-   st.json(event,expanded=False)
+ final_event=next((event for event in reversed(events) if event.get('stage')=='agent_merge_final'),{})
+ final_items=(final_event.get('data') or {}).get('items',[])
+ plan_event=next((event for event in events if event.get('stage')=='query_plan'),{})
+ plan=(plan_event.get('data') or {}).get('plan',{})
+ context_event=next((event for event in events if event.get('stage')=='answer_context'),{})
+ context_data=context_event.get('data') or {}
+ llm_event=next((event for event in reversed(events) if event.get('stage')=='llm_request'),{})
+ details=final_event.get('details') or {}
+ with st.expander('Developer console · inspect the complete RAG pipeline',expanded=True):
+  st.caption('Testing mode. This panel shows what each component received, returned and passed to the next component. Disable RAG_DEBUG_TRACE before a normal demo or production use.')
+  c1,c2,c3,c4=st.columns(4)
+  c1.metric('Final chunks',len(final_items),'maximum 3')
+  c2.metric('Requested types',len(details.get('requested_types',[])))
+  c3.metric('Diagram images sent',sum(1 for item in context_data.get('visual_inputs',[]) if item.get('attached_to_openai_request')))
+  c4.metric('LLM model',llm_event.get('details',{}).get('model','not called'))
+  tabs=st.tabs(['Pipeline','Selected chunks','Diagram images','LLM handoff','Raw events'])
+  with tabs[0]:
+   st.markdown('**1. Question → modality planner**')
+   st.write('Planner:',plan.get('planner','not recorded'))
+   if plan.get('planner_reason'):st.caption(plan['planner_reason'])
+   if plan.get('tasks'):st.json(plan['tasks'],expanded=True)
+   st.markdown('**2. Separate retrieval passes → fusion → top three**')
+   if details:
+    st.write({'requested_types':details.get('requested_types',[]),'selected_types':details.get('selected_types',[]),'types_without_evidence':details.get('types_without_evidence',[]),'unique_candidates':details.get('unique_items_before_top_k'),'final_chunks':details.get('returned')})
+   st.markdown('**3. Component timeline and duration**')
+   for index,event in enumerate(events,1):
+    stage=event.get('stage','stage')
+    duration=f" · {event['duration_ms']} ms" if event.get('duration_ms') is not None else ''
+    status=event.get('status','unknown')
+    icon='✅' if status in ('complete','passed','loaded','called') else ('⚠️' if status in ('warning','skipped','fallback','abstained') else ('❌' if status=='failed' else '•'))
+    st.markdown(f"**{index}. {icon} {stage}**{duration} · +{event.get('elapsed_from_request_start_ms',0)} ms")
+    st.caption(f"{event.get('component','')} · {status} · {event.get('details',{})}")
+  with tabs[1]:
+   if not final_items:st.info('No final evidence was selected. Check the retrieval and evidence-gate events.')
+   for item in final_items:
+    kind=item.get('content_type','text')
+    with st.container(border=True):
+     st.markdown(f"**#{item.get('rank','?')} · {kind.upper()} · {item.get('document','')} · page {item.get('page','?')}**")
+     st.caption(f"Final score: {item.get('final_score',item.get('retrieval_score'))} · RRF: {item.get('rrf_score')} · graph expanded: {item.get('graph_expanded',False)}")
+     if item.get('retrieved_by'):st.caption('Why retrieved: '+str(item['retrieved_by']))
+     if kind=='formula' and item.get('latex'):st.latex(str(item['latex']).replace('$$','').replace('$','').strip())
+     elif item.get('text'):st.markdown(str(item['text']))
+     if kind=='table' and item.get('table_json'):st.json(item['table_json'],expanded=False)
+     asset=item.get('asset_path')
+     if asset and Path(asset).is_file():st.image(asset,caption=f"Retrieved figure · {item.get('document')} · page {item.get('page')}")
+     st.caption(f"Asset path: {asset or 'none'}")
+     st.caption(f"Extracted record path: {item.get('file_path') or 'not recorded'}")
+  with tabs[2]:
+   visuals=context_data.get('visual_inputs',[])
+   if not visuals:st.info('No figure chunk was selected for the final answer.')
+   for visual in visuals:
+    with st.container(border=True):
+     st.write({'document':visual.get('document'),'page':visual.get('page'),'asset_path':visual.get('asset_path'),'attached_to_openai_request':visual.get('attached_to_openai_request'),'warning':visual.get('warning')})
+     if visual.get('asset_path') and Path(visual['asset_path']).is_file():st.image(visual['asset_path'],caption='Image input prepared for the OpenAI request')
+  with tabs[3]:
+   if context_data:
+    st.markdown('**Exact text/LaTeX/table context sent to the answer model**')
+    st.code(context_data.get('context_sent_to_model',''),language='text')
+    st.markdown('**Visual image inputs**')
+    st.json(context_data.get('visual_inputs',[]),expanded=True)
+   else:st.info('No answer context was prepared. Check whether retrieval returned evidence.')
+   if llm_event:
+    st.markdown('**OpenAI response / request status**')
+    st.json({'status':llm_event.get('status'),'details':llm_event.get('details'),'answer':(llm_event.get('data') or {}).get('answer')},expanded=True)
+  with tabs[4]:
+   for index,event in enumerate(events,1):
+    st.markdown(f"**Event {index}: {event.get('stage','')}**")
+    st.json(event,expanded=False)
+
 
 if 'messages' not in st.session_state:st.session_state.messages=[]
 for m in st.session_state.messages:
@@ -116,7 +177,7 @@ if q:
  with st.chat_message('assistant'):
   try:
    if not st.session_state.get('token'):raise RuntimeError('Sign in first (employee / shared demo password)')
-   payload={'question':q,'session_id':st.session_state.get('session_id')}
+   payload={'question':q,'top_k':3,'session_id':st.session_state.get('session_id')}
    with st.spinner('Searching authorized graph evidence...'):
     r=requests.post(f'{API}/ask',json=payload,headers={'Authorization':f"Bearer {st.session_state['token']}"},timeout=180);r.raise_for_status();d=r.json()
    st.session_state['session_id']=d['session_id'];st.session_state['last_flow_trace']=d.get('flow_trace',[]);st.session_state['last_flow_summary']=f"{d['mode']} · {d['latency_seconds']} seconds"
