@@ -90,12 +90,25 @@ def show_sources(sources,headers):
    except Exception:
     st.caption('Figure asset could not be displayed')
 
+def show_debug_trace(events):
+ if not events:return
+ with st.expander('Developer trace · every retrieval step',expanded=True):
+  st.caption('Local debugging only. Includes retrieved text, scores, model/DB steps, file paths and timings. Review this before changing the UI to a normal chatbot.')
+  for index,event in enumerate(events,1):
+   duration=f" · {event['duration_ms']} ms" if event.get('duration_ms') is not None else ''
+   elapsed=f" · +{event.get('elapsed_from_request_start_ms',0)} ms"
+   st.markdown(f"**{index}. {event.get('stage','Stage')}**{duration}{elapsed}")
+   st.caption(f"{event.get('component','')} · {event.get('status','unknown')} · {event.get('timestamp','')}")
+   if event.get('details'):st.caption(str(event['details']))
+   st.json(event,expanded=False)
+
 if 'messages' not in st.session_state:st.session_state.messages=[]
 for m in st.session_state.messages:
  with st.chat_message(m['role']):
   st.markdown(m['content'])
   if m.get('sources'):
    with st.expander('Evidence and sources'):show_sources(m['sources'],{'Authorization':f"Bearer {st.session_state.get('token','')}"})
+  if m.get('debug_trace'):show_debug_trace(m['debug_trace'])
 q=st.chat_input('Ask about documents')
 if q:
  st.session_state.messages.append({'role':'user','content':q})
@@ -110,7 +123,9 @@ if q:
    st.markdown(d['answer']);st.caption(f"{d['mode']} · turn {d.get('session_turns','?')} · {d['latency_seconds']} seconds")
    if d['sources']:
     with st.expander('Evidence and sources',expanded=True):show_sources(d['sources'],{'Authorization':f"Bearer {st.session_state['token']}"})
-   st.session_state.messages.append({'role':'assistant','content':d['answer'],'sources':d['sources']})
+   debug_events=d.get('debug_trace',[])
+   if debug_events:show_debug_trace(debug_events)
+   st.session_state.messages.append({'role':'assistant','content':d['answer'],'sources':d['sources'],'debug_trace':debug_events})
   except Exception as e:
    detail=None
    response=getattr(e,'response',None)
@@ -119,6 +134,7 @@ if q:
     except Exception:detail=None
    if isinstance(detail,dict):
     st.session_state['last_flow_trace']=detail.get('flow_trace',[{'step':'FastAPI request','component':'HTTP API','status':'failed','detail':detail.get('message','Request failed')}])
+    if detail.get('debug_trace'):show_debug_trace(detail['debug_trace'])
     st.error(f"Backend request failed: {detail.get('message','Request failed')}")
    else:
     st.session_state['last_flow_trace']=[{'step':'Browser to backend request','component':'Streamlit requests.post → FastAPI /ask','status':'failed','detail':f'{type(e).__name__}: {e}'}]
