@@ -1,0 +1,36 @@
+name: Python tests
+
+on:
+  push:
+    branches:
+      - feature/multimodal-agentic-rag
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "fastapi==0.115.12" \
+            "httpx==0.28.1" \
+            "neo4j>=5.26,<7" \
+            "numpy>=1.26,<3" \
+            "python-dotenv==1.1.0" \
+            "python-multipart==0.0.20" \
+            "pytest==8.3.5" \
+            "requests>=2.34.2,<3"
+      - name: Run unit tests
+        run: python -m pytest -q
