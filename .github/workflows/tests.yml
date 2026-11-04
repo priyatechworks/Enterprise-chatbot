@@ -3,6 +3,7 @@ name: Python tests
 on:
   push:
     branches:
+      - main
       - feature/multimodal-agentic-rag
   pull_request:
     branches:
