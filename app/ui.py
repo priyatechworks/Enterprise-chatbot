@@ -70,11 +70,25 @@ with st.sidebar:
  st.caption('Fictional sample data only. Do not use real confidential data in this demo.')
 
 def show_sources(sources,headers):
- for s in sources:
-  st.markdown(f"**{s['document']} · page {s['page']} · {s['kind']} · {s['score']}**\n\n{s['excerpt']}")
-  if s.get('asset_name'):
-   try:st.image(requests.get(f"{API}/assets/{s['asset_name']}",headers=headers,timeout=15).content,caption=f"{s['document']} · page {s['page']}")
-   except Exception:st.caption('Image asset could not be displayed')
+ for source in sources:
+  content_type=source.get('content_type',source.get('kind','text'))
+  st.markdown(f"**{source['document']} · page {source['page']} · {content_type} · {source['score']}**")
+  if source.get('caption'):st.caption(f"Caption: {source['caption']}")
+  if source.get('section'):st.caption(f"Section: {source['section']}")
+  if content_type=='formula' and source.get('latex'):
+   formula=source['latex'].replace('$$','').replace('$','').strip()
+   if formula:st.latex(formula)
+   else:st.markdown(source['excerpt'])
+  else:
+   # Table chunks are retained as Docling markdown so Streamlit can render tabular rows.
+   st.markdown(source['excerpt'])
+  if source.get('asset_name'):
+   try:
+    response=requests.get(f"{API}/assets/{source['asset_name']}",headers=headers,timeout=15)
+    response.raise_for_status()
+    st.image(response.content,caption=f"{source['document']} · page {source['page']}")
+   except Exception:
+    st.caption('Figure asset could not be displayed')
 
 if 'messages' not in st.session_state:st.session_state.messages=[]
 for m in st.session_state.messages:

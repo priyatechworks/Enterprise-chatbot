@@ -12,7 +12,7 @@ import numpy as np
 from neo4j import GraphDatabase
 
 from app.config import (
-    ASSET_DIR, CHUNK_MAX_TOKENS, CROSS_ENCODER_ENABLED, CROSS_ENCODER_MODEL, EMBEDDING_BATCH_SIZE,
+    ASSET_DIR, EXTRACTED_DIR, CHUNK_MAX_TOKENS, CROSS_ENCODER_ENABLED, CROSS_ENCODER_MODEL, EMBEDDING_BATCH_SIZE,
     DOCLING_ENABLE_FORMULA_ENRICHMENT, DOCLING_ENABLE_OCR,
     DOCLING_EXTRACT_PICTURES, DOCLING_GENERATE_PAGE_IMAGES, DOCLING_GRAPH_TEMPLATE,
     DOC_GRAPH_PROVIDER, EMBEDDING_DIMENSION, GRAPH_MAX_HOPS, LLM_API_KEY,
@@ -21,6 +21,9 @@ from app.config import (
     RETRIEVAL_THRESHOLD, TEXT_MODEL, VISION_MODEL,
 )
 from app.storage import get_document, record_failure, upsert_document
+from app.metadata import persist_extracted_records
+from app.vision import describe_image
+from app.agent import plan_query
 
 _driver = None
 _neo4j_supports_search = False
@@ -68,52 +71,56 @@ def driver():
     return _driver
 
 
-def _vector_query(session, query_vector, role, limit, candidate_limit, restricted=False):
+def _vector_query(session, query_vector, role, limit, candidate_limit, restricted=False, kinds=None):
+    kinds = kinds or ["text", "table", "figure", "formula"]
     if _neo4j_supports_search:
         authorization = 'NOT $role IN node.allowed_roles' if restricted else '$role IN node.allowed_roles'
         similarity = ' AND score>=0.34' if restricted else ''
         return list(session.run(
             'CYPHER 25 MATCH (node:KnowledgeItem) '
             'SEARCH node IN (VECTOR INDEX knowledge_embedding FOR $embedding LIMIT $limit) SCORE AS score '
-            f'WHERE {authorization}{similarity} '
+            f'WHERE {authorization} AND node.kind IN $kinds{similarity} '
             + ('RETURN score ORDER BY score DESC LIMIT 1' if restricted else 'RETURN node,score ORDER BY score DESC LIMIT $candidate_limit'),
-            embedding=query_vector, limit=limit, candidate_limit=candidate_limit, role=role,
+            embedding=query_vector, limit=limit, candidate_limit=candidate_limit, role=role, kinds=kinds,
         ))
     if restricted:
         return list(session.run(
             "CALL db.index.vector.queryNodes('knowledge_embedding',$limit,$embedding) YIELD node,score "
-            "WHERE NOT $role IN node.allowed_roles AND score>=0.34 RETURN score ORDER BY score DESC LIMIT 1",
-            limit=limit, embedding=query_vector, role=role,
+            "WHERE NOT $role IN node.allowed_roles AND node.kind IN $kinds AND score>=0.34 "
+            "RETURN score ORDER BY score DESC LIMIT 1",
+            limit=limit, embedding=query_vector, role=role, kinds=kinds,
         ))
     return list(session.run(
         "CALL db.index.vector.queryNodes('knowledge_embedding',$limit,$embedding) YIELD node,score "
-        "WHERE $role IN node.allowed_roles RETURN node,score ORDER BY score DESC LIMIT $candidate_limit",
-        limit=limit, candidate_limit=candidate_limit, embedding=query_vector, role=role,
+        "WHERE $role IN node.allowed_roles AND node.kind IN $kinds "
+        "RETURN node,score ORDER BY score DESC LIMIT $candidate_limit",
+        limit=limit, candidate_limit=candidate_limit, embedding=query_vector, role=role, kinds=kinds,
     ))
 
-
-def _fulltext_query(session, lucene_query, role, limit, candidate_limit, restricted=False):
+def _fulltext_query(session, lucene_query, role, limit, candidate_limit, restricted=False, kinds=None):
+    kinds = kinds or ["text", "table", "figure", "formula"]
     if _neo4j_supports_fulltext_search:
         authorization = 'NOT $role IN node.allowed_roles' if restricted else '$role IN node.allowed_roles'
         return list(session.run(
             'CYPHER 25 MATCH (node:KnowledgeItem) '
             'SEARCH node IN (FULLTEXT INDEX knowledge_text FOR $lucene_query LIMIT $limit) SCORE AS score '
-            f'WHERE {authorization} '
+            f'WHERE {authorization} AND node.kind IN $kinds '
             + ('RETURN score ORDER BY score DESC LIMIT 1' if restricted else 'RETURN node,score ORDER BY score DESC LIMIT $candidate_limit'),
-            lucene_query=lucene_query, limit=limit, candidate_limit=candidate_limit, role=role,
+            lucene_query=lucene_query, limit=limit, candidate_limit=candidate_limit, role=role, kinds=kinds,
         ))
     if restricted:
         return list(session.run(
             "CALL db.index.fulltext.queryNodes('knowledge_text',$lucene_query,{limit:$limit}) YIELD node,score "
-            "WHERE NOT $role IN node.allowed_roles RETURN score ORDER BY score DESC LIMIT 1",
-            lucene_query=lucene_query, limit=limit, role=role,
+            "WHERE NOT $role IN node.allowed_roles AND node.kind IN $kinds "
+            "RETURN score ORDER BY score DESC LIMIT 1",
+            lucene_query=lucene_query, limit=limit, role=role, kinds=kinds,
         ))
     return list(session.run(
         "CALL db.index.fulltext.queryNodes('knowledge_text',$lucene_query,{limit:$limit}) YIELD node,score "
-        "WHERE $role IN node.allowed_roles RETURN node,score ORDER BY score DESC LIMIT $candidate_limit",
-        lucene_query=lucene_query, limit=limit, candidate_limit=candidate_limit, role=role,
+        "WHERE $role IN node.allowed_roles AND node.kind IN $kinds "
+        "RETURN node,score ORDER BY score DESC LIMIT $candidate_limit",
+        lucene_query=lucene_query, limit=limit, candidate_limit=candidate_limit, role=role, kinds=kinds,
     ))
-
 
 def text_model():
     global _text_model
@@ -227,62 +234,191 @@ def _policy_roles(classification):
     raise ValueError("Classification must be 'Public' or 'Admin-only'")
 
 
-def _extract_docling(path, document_name):
+def _plain_payload(value):
+    """Convert Docling/Pydantic objects into JSON-safe metadata."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _plain_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_payload(item) for item in value]
+    for method in ("model_dump", "dict", "to_dict"):
+        if hasattr(value, method):
+            try:
+                return _plain_payload(getattr(value, method)())
+            except Exception:
+                pass
+    return str(value)
+
+
+def _item_provenance(item):
+    provenance = []
+    for prov in (getattr(item, "prov", None) or []):
+        bbox = getattr(prov, "bbox", None)
+        provenance.append({
+            "page_no": getattr(prov, "page_no", None),
+            "bbox": _plain_payload(bbox),
+        })
+    return provenance
+
+
+def _item_caption(item, document):
+    try:
+        caption = item.caption_text(document)
+        return str(caption).strip() if caption else ""
+    except Exception:
+        return ""
+
+
+def _item_ref(item):
+    try:
+        ref = item.get_ref()
+        return str(getattr(ref, "cref", ref))
+    except Exception:
+        return ""
+
+
+def _extract_docling(path, document_name, document_id=None):
     result = _docling_converter_for_settings().convert(path)
     document = result.document
     records = []
-    for chunk in _chunker().chunk(document):
-        chunk_items = list(getattr(getattr(chunk, 'meta', None), 'doc_items', []) or [])
-        labels = {str(getattr(getattr(item, 'label', ''), 'value', getattr(item, 'label', ''))).lower() for item in chunk_items}
-        if 'picture' in labels:
-            continue
-        kind = 'table' if 'table' in labels else 'text'
+    page_headings = {}
+    chunker = _chunker()
+
+    # Text and tables are chunked using Docling's layout-aware HybridChunker.
+    for chunk in chunker.chunk(document):
+        chunk_items = list(getattr(getattr(chunk, "meta", None), "doc_items", []) or [])
+        labels = {
+            str(getattr(getattr(item, "label", ""), "value", getattr(item, "label", ""))).lower()
+            for item in chunk_items
+        }
         page_numbers = [
             int(prov.page_no)
             for item in chunk_items
-            for prov in (getattr(item, 'prov', []) or [])
-            if getattr(prov, 'page_no', None) is not None
+            for prov in (getattr(item, "prov", []) or [])
+            if getattr(prov, "page_no", None) is not None
         ]
         page = page_numbers[0] if page_numbers else 1
-        text = _chunker().contextualize(chunk).strip()
-        if text:
-            headings = list(getattr(getattr(chunk, 'meta', None), 'headings', []) or [])
-            records.append({'kind': kind, 'page': page, 'text': text, 'headings': headings})
+        text = chunker.contextualize(chunk).strip()
+        if not text:
+            continue
+        headings = list(getattr(getattr(chunk, "meta", None), "headings", []) or [])
+        if headings:
+            for page_number in (page_numbers or [page]):
+                page_headings[int(page_number)] = headings
+        table_items = [
+            item for item in chunk_items
+            if str(getattr(getattr(item, "label", ""), "value", getattr(item, "label", ""))).lower() == "table"
+        ]
+        table_payload = None
+        caption = ""
+        provenance = []
+        docling_ref = ""
+        if table_items:
+            table_item = table_items[0]
+            table_payload = _plain_payload(getattr(table_item, "data", None))
+            caption = _item_caption(table_item, document)
+            provenance = _item_provenance(table_item)
+            docling_ref = _item_ref(table_item)
+        records.append({
+            "kind": "table" if "table" in labels else "text",
+            "page": page,
+            "text": text,
+            "headings": headings,
+            "caption": caption,
+            "structured_data": table_payload,
+            "provenance": provenance,
+            "docling_ref": docling_ref,
+            "bbox": provenance[0].get("bbox") if provenance else None,
+        })
 
-    images = []
+    # Formula understanding produces TextItems labelled FORMULA. Keep them as
+    # independent retrievable records in addition to their surrounding text.
+    for item, _level in document.iterate_items():
+        label = str(getattr(getattr(item, "label", ""), "value", getattr(item, "label", ""))).lower()
+        if label != "formula":
+            continue
+        formula_text = str(getattr(item, "text", "") or getattr(item, "orig", "") or "").strip()
+        if not formula_text:
+            continue
+        provenance = _item_provenance(item)
+        page = int(provenance[0].get("page_no") or 1) if provenance else 1
+        records.append({
+            "kind": "formula",
+            "page": page,
+            "text": formula_text,
+            "latex": formula_text,
+            "caption": "",
+            "headings": page_headings.get(page, []),
+            "provenance": provenance,
+            "bbox": provenance[0].get("bbox") if provenance else None,
+            "docling_ref": _item_ref(item),
+        })
+
+    # Figures are stored as individual crops. Nomic Vision vectors are aligned
+    # with Nomic Text v1.5, so a natural-language query can find these vectors.
+    if DOCLING_EXTRACT_PICTURES:
+        for picture in getattr(document, "pictures", []) or []:
+            image = picture.get_image(doc=document)
+            if image is None:
+                continue
+            page_prov = _item_provenance(picture)
+            page = int(page_prov[0].get("page_no") or 1) if page_prov else 1
+            caption = _item_caption(picture, document)
+            target = ASSET_DIR / f"{uuid.uuid4().hex}.png"
+            image.save(target)
+            description, description_warning = describe_image(
+                target, caption=caption, document_name=document_name, page=page
+            )
+            records.append({
+                "kind": "figure",
+                "page": page,
+                "text": description,
+                "caption": caption,
+                "asset_path": str(target.resolve()),
+                "headings": page_headings.get(page, []),
+                "provenance": page_prov,
+                "bbox": page_prov[0].get("bbox") if page_prov else None,
+                "docling_ref": _item_ref(picture),
+                "description_warning": description_warning,
+            })
+
     if DOCLING_GENERATE_PAGE_IMAGES:
         for page_number, page_item in document.pages.items():
-            image_ref = getattr(page_item, 'image', None)
-            page_image = getattr(image_ref, 'pil_image', None) if image_ref else None
+            image_ref = getattr(page_item, "image", None)
+            page_image = getattr(image_ref, "pil_image", None) if image_ref else None
             if page_image is None:
                 continue
             target = ASSET_DIR / f"{uuid.uuid4().hex}.png"
             page_image.save(target)
-            images.append({
-                'kind': 'image', 'page': int(page_number),
-                'text': f"Full-page image from {document_name}, page {page_number}",
-                'asset_path': str(target), 'headings': [],
+            description, description_warning = describe_image(
+                target, caption=f"Full page image from {document_name}", document_name=document_name, page=int(page_number)
+            )
+            records.append({
+                "kind": "figure", "page": int(page_number), "text": description,
+                "caption": f"Full page image from {document_name}, page {page_number}",
+                "asset_path": str(target.resolve()), "headings": page_headings.get(int(page_number), []),
+                "provenance": [{"page_no": int(page_number), "bbox": None}],
+                "bbox": None, "docling_ref": "", "description_warning": description_warning,
             })
-    if DOCLING_EXTRACT_PICTURES:
-        for item, _level in document.iterate_items():
-            label = str(getattr(getattr(item, 'label', ''), 'value', getattr(item, 'label', ''))).lower()
-            if label != 'picture':
-                continue
-            picture = item.get_image(doc=document)
-            if not picture:
-                continue
-            page = int(item.prov[0].page_no) if getattr(item, 'prov', None) else 1
-            target = ASSET_DIR / f"{uuid.uuid4().hex}.png"
-            picture.save(target)
-            images.append({
-                'kind': 'image', 'page': page,
-                'text': f"Image/figure from {document_name}, page {page}",
-                'asset_path': str(target), 'headings': [],
-            })
-    if not records and not images:
-        raise ValueError('Docling found no text, tables or enabled picture content')
-    return len(document.pages), records + images
 
+    # Retain Docling's full structured document export for debugging and audit.
+    master_path = None
+    if document_id and hasattr(document, "export_to_dict"):
+        try:
+            master_dir = EXTRACTED_DIR / "docling"
+            master_dir.mkdir(parents=True, exist_ok=True)
+            master_path = master_dir / f"{document_id}.json"
+            master_path.write_text(
+                json.dumps(_plain_payload(document.export_to_dict()), ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            master_path = None
+
+    if not records:
+        raise ValueError("Docling found no searchable text, tables, formulas or figures")
+    return len(document.pages), records
 
 def _fallback_text_records(path):
     """Fallback emits page-scoped chunks bounded by the same model tokenizer."""
@@ -313,19 +449,38 @@ def _fallback_text_records(path):
 
 
 def _prepare_graph_rows(name, document_id, classification, roles, records):
-    text_records = [record for record in records if record['kind'] != 'image']
-    vectors = iter(text_embeddings([record['text'] for record in text_records]))
+    visual_kinds = {"image", "figure"}
+    text_records = [record for record in records if record["kind"] not in visual_kinds]
+    vectors = iter(text_embeddings([record["text"] for record in text_records]))
     rows = []
     for ordinal, record in enumerate(records):
-        vector = image_embedding(record['asset_path']) if record['kind'] == 'image' else next(vectors)
-        chunk_id = f'{document_id}:{ordinal}'
+        kind = "figure" if record["kind"] in visual_kinds else record["kind"]
+        vector = image_embedding(record["asset_path"]) if kind == "figure" else next(vectors)
+        chunk_id = str(record.get("item_id") or f"{document_id}:{ordinal}")
+        section = str(record.get("section") or "Unsectioned")
+        section_key = str(record.get("section_key") or hashlib.sha256(
+            f"{document_id}:{section.casefold()}".encode()
+        ).hexdigest()[:24])
+        provenance = json.dumps(record.get("provenance", []), ensure_ascii=False, default=str)
+        bbox = json.dumps(record.get("bbox"), ensure_ascii=False, default=str) if record.get("bbox") is not None else ""
         rows.append({
-            'id': chunk_id, 'chunk_id': chunk_id, 'document': name,
-            'document_id': document_id, 'classification': classification,
-            'allowed_roles': roles, 'page': int(record['page']), 'kind': record['kind'],
-            'text': record['text'], 'headings': record.get('headings', []),
-            'asset_path': record.get('asset_path', ''), 'ordinal': ordinal,
-            'embedding': vector.tolist(),
+            "id": chunk_id, "chunk_id": chunk_id, "item_id": chunk_id,
+            "document": name, "document_id": document_id,
+            "classification": classification, "allowed_roles": roles,
+            "page": int(record["page"]), "kind": kind, "content_type": kind,
+            "text": str(record.get("text", "")), "headings": record.get("headings", []),
+            "asset_path": record.get("asset_path", ""),
+            "file_path": record.get("file_path", record.get("asset_path", "")),
+            "caption": str(record.get("caption") or ""),
+            "section": section, "section_key": section_key,
+            "section_id": f"{document_id}:{section_key}",
+            "docling_ref": str(record.get("docling_ref") or ""),
+            "provenance_json": provenance, "bbox_json": bbox,
+            "table_json": json.dumps(record.get("structured_data"), ensure_ascii=False, default=str)
+                if record.get("structured_data") is not None else "",
+            "latex": str(record.get("latex") or ""),
+            "description_warning": str(record.get("description_warning") or ""),
+            "ordinal": ordinal, "embedding": vector.tolist() if hasattr(vector, "tolist") else list(vector),
         })
     return rows
 
@@ -336,10 +491,10 @@ def _replace_graph_document(name, document_id, classification, roles, page_count
 
     def replace(tx):
         old_assets.extend([
-            record['asset_path'] for record in tx.run(
+            record["asset_path"] for record in tx.run(
                 "MATCH (k:KnowledgeItem) WHERE k.document_id=$document_id OR k.document=$name "
                 "RETURN k.asset_path AS asset_path", document_id=document_id, name=name,
-            ) if record['asset_path']
+            ) if record["asset_path"]
         ])
         tx.run(
             "MATCH (d:Document) WHERE d.document_id=$document_id OR d.name=$name DETACH DELETE d",
@@ -350,11 +505,15 @@ def _replace_graph_document(name, document_id, classification, roles, page_count
             document_id=document_id, name=name,
         )
         tx.run(
+            "MATCH (s:Section) WHERE s.document_id=$document_id DETACH DELETE s",
+            document_id=document_id,
+        )
+        tx.run(
             "MATCH (e:KGEntity) WHERE e.document_id=$document_id OR e.document=$name DETACH DELETE e",
             document_id=document_id, name=name,
         )
         tx.run(
-            "CREATE (d:Document {document_id:$document_id,name:$name,classification:$classification," 
+            "CREATE (d:Document {document_id:$document_id,name:$name,classification:$classification,"
             "allowed_roles:$roles,page_count:$page_count,updated_at:datetime()})",
             document_id=document_id, name=name, classification=classification,
             roles=roles, page_count=page_count,
@@ -362,16 +521,41 @@ def _replace_graph_document(name, document_id, classification, roles, page_count
         if rows:
             tx.run(
                 "MATCH (d:Document {document_id:$document_id}) UNWIND $rows AS row "
-                "CREATE (k:KnowledgeItem {id:row.id,chunk_id:row.chunk_id,document:row.document," 
-                "document_id:row.document_id,classification:row.classification,allowed_roles:row.allowed_roles," 
-                "page:row.page,kind:row.kind,text:row.text,headings:row.headings,asset_path:row.asset_path," 
-                "ordinal:row.ordinal,embedding:row.embedding}) CREATE (d)-[:HAS_ITEM]->(k)",
+                "MERGE (s:Section {id:row.section_id}) "
+                "SET s.document_id=$document_id,s.title=row.section,s.section_key=row.section_key "
+                "MERGE (d)-[:HAS_SECTION]->(s) "
+                "CREATE (k:KnowledgeItem {id:row.id,chunk_id:row.chunk_id,item_id:row.item_id,"
+                "document:row.document,document_id:row.document_id,classification:row.classification,"
+                "allowed_roles:row.allowed_roles,page:row.page,kind:row.kind,content_type:row.content_type,"
+                "text:row.text,headings:row.headings,asset_path:row.asset_path,file_path:row.file_path,"
+                "caption:row.caption,section:row.section,section_key:row.section_key,section_id:row.section_id,"
+                "docling_ref:row.docling_ref,provenance_json:row.provenance_json,bbox_json:row.bbox_json,"
+                "table_json:row.table_json,latex:row.latex,description_warning:row.description_warning,"
+                "ordinal:row.ordinal,embedding:row.embedding}) "
+                "CREATE (d)-[:HAS_ITEM]->(k) MERGE (s)-[:HAS_CONTENT]->(k)",
                 document_id=document_id, rows=rows,
             )
             tx.run(
                 "MATCH (d:Document {document_id:$document_id})-[:HAS_ITEM]->(a:KnowledgeItem), "
                 "(d)-[:HAS_ITEM]->(b:KnowledgeItem) WHERE b.ordinal=a.ordinal+1 "
                 "MERGE (a)-[:NEXT]->(b)", document_id=document_id,
+            )
+            # Explicit type edges make the section's multimodal contents discoverable.
+            for kind, relationship in (
+                ("text", "CONTAINS_TEXT"), ("table", "CONTAINS_TABLE"),
+                ("figure", "CONTAINS_FIGURE"), ("formula", "CONTAINS_FORMULA"),
+            ):
+                tx.run(
+                    "MATCH (s:Section)-[:HAS_CONTENT]->(k:KnowledgeItem) "
+                    "WHERE k.document_id=$document_id AND k.kind=$kind "
+                    f"MERGE (s)-[:{relationship}]->(k)",
+                    document_id=document_id, kind=kind,
+                )
+            # Co-location is a source-grounded relation, not an LLM-invented semantic edge.
+            tx.run(
+                "MATCH (a:KnowledgeItem {document_id:$document_id}),(b:KnowledgeItem {document_id:$document_id}) "
+                "WHERE a.page=b.page AND a.ordinal<b.ordinal AND a.kind<>b.kind "
+                "MERGE (a)-[:RELATED_ON_PAGE]->(b)", document_id=document_id,
             )
 
     with database.session(database=NEO4J_DATABASE) as session:
@@ -381,7 +565,6 @@ def _replace_graph_document(name, document_id, classification, roles, page_count
         if candidate.is_relative_to(ASSET_DIR.resolve()) and candidate.is_file():
             candidate.unlink(missing_ok=True)
     return len(rows)
-
 
 def _extract_semantic_graph(path):
     if not DOCLING_GRAPH_TEMPLATE:
@@ -459,13 +642,16 @@ def ingest_file(path, classification='Admin-only', document_name=None, document_
         existing = get_document(name)
         document_id = (existing.get('document_id') if existing else None) or document_id or str(uuid.uuid4())
         try:
-            page_count, records = _extract_docling(path, name)
+            page_count, records = _extract_docling(path, name, document_id)
             parse_mode, parse_warning = 'docling-hybrid-chunker', None
         except Exception as parse_error:
             page_count, records = _fallback_text_records(path)
             parse_mode, parse_warning = 'pymupdf-tokenizer-fallback', type(parse_error).__name__
             if not records:
                 raise ValueError(f'Docling failed ({parse_warning}) and PyMuPDF found no selectable text')
+        records, artifact_summary = persist_extracted_records(
+            document_id, name, page_count, classification, roles, records
+        )
         semantic_graph = _extract_semantic_graph(path)
         rows = _prepare_graph_rows(name, document_id, classification, roles, records)
         count = _replace_graph_document(name, document_id, classification, roles, page_count, rows)
@@ -480,10 +666,19 @@ def ingest_file(path, classification='Admin-only', document_name=None, document_
             'name': name, 'document_id': document_id, 'classification': classification,
             'allowed_roles': roles, 'pages': page_count, 'chunks': count,
             'tables': sum(row['kind'] == 'table' for row in rows),
-            'images': sum(row['kind'] == 'image' for row in rows),
+            'figures': sum(row['kind'] == 'figure' for row in rows),
+            'formulas': sum(row['kind'] == 'formula' for row in rows),
+            'images': sum(row['kind'] == 'figure' for row in rows),
             'entities': semantic_counts['entities'], 'relations': semantic_counts['relations'],
+            'artifacts': artifact_summary.get('artifacts', {}),
+            'content_counts': artifact_summary.get('counts', {}),
             'parser': parse_mode, 'status': 'indexed',
         }
+        description_warnings = [
+            row.get('description_warning') for row in rows if row.get('description_warning')
+        ]
+        if description_warnings:
+            result['figure_description_warning'] = '; '.join(dict.fromkeys(description_warnings))
         if parse_warning:
             result['warning'] = f'Docling failed; indexed selectable text via PyMuPDF ({parse_warning})'
         if semantic_warning:
@@ -532,8 +727,15 @@ def reciprocal_rank_fusion(vector_rows, keyword_rows, rrf_constant=60):
                 'id': chunk_id, 'chunk_id': chunk_id,
                 'document_id': node.get('document_id', ''),
                 'document': node['document'], 'page': int(node['page']),
-                'kind': node['kind'], 'text': node['text'],
-                'asset_path': node.get('asset_path', ''),
+                'kind': node['kind'], 'content_type': node.get('content_type', node['kind']),
+                'text': node['text'], 'asset_path': node.get('asset_path', ''),
+                'file_path': node.get('file_path', node.get('asset_path', '')),
+                'caption': node.get('caption', ''), 'section': node.get('section', ''),
+                'section_key': node.get('section_key', ''), 'latex': node.get('latex', ''),
+                'docling_ref': node.get('docling_ref', ''),
+                'bbox_json': node.get('bbox_json', ''),
+                'provenance_json': node.get('provenance_json', ''),
+                'table_json': node.get('table_json', ''),
                 'allowed_roles': list(node.get('allowed_roles', [])), 'rrf_score': 0.0,
             })
             item[f'{source}_rank'] = rank
@@ -547,22 +749,26 @@ def reciprocal_rank_fusion(vector_rows, keyword_rows, rrf_constant=60):
     return sorted(fused.values(), key=lambda item: item['rrf_score'], reverse=True)
 
 
-def search(query, role, top_k=5, history=None, max_hops=None):
+def search(query, role, top_k=5, history=None, max_hops=None, content_types=None):
+    allowed_types = list(dict.fromkeys(
+        kind for kind in (content_types or ["text", "table", "figure", "formula"])
+        if kind in {"text", "table", "figure", "formula"}
+    )) or ["text"]
     database = driver()
     query_vector = np.asarray(text_embeddings([query], query=True)[0], dtype=np.float32).tolist()
     candidate_limit = max(RETRIEVAL_CANDIDATE_K, top_k)
     index_limit = candidate_limit * 5  # over-fetch to account for inaccessible hits before ACL filtering
     keyword_query = _lucene_query(query)
     with database.session(database=NEO4J_DATABASE) as session:
-        vector_rows = _vector_query(session, query_vector, role, index_limit, candidate_limit)
+        vector_rows = _vector_query(session, query_vector, role, index_limit, candidate_limit, kinds=allowed_types)
         keyword_rows = []
         restricted_vector = []
         restricted_keyword = []
         if keyword_query:
-            keyword_rows = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit)
+            keyword_rows = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit, kinds=allowed_types)
             # These denial probes return scores only; no restricted document text or name escapes Neo4j.
-            restricted_keyword = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit, restricted=True)
-        restricted_vector = _vector_query(session, query_vector, role, index_limit, candidate_limit, restricted=True)
+            restricted_keyword = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit, restricted=True, kinds=allowed_types)
+        restricted_vector = _vector_query(session, query_vector, role, index_limit, candidate_limit, restricted=True, kinds=allowed_types)
 
         ranked = reciprocal_rank_fusion(vector_rows, keyword_rows)
         fused = {item['id']: item for item in ranked}
@@ -572,7 +778,7 @@ def search(query, role, top_k=5, history=None, max_hops=None):
         if seeds and hops:
             expanded += list(session.run(
                 "MATCH (seed:KnowledgeItem) WHERE seed.id IN $ids AND $role IN seed.allowed_roles "
-                "MATCH p=(seed)-[:NEXT*1..2]-(neighbor:KnowledgeItem) "
+                "MATCH p=(seed)-[:NEXT|RELATED_ON_PAGE*1..2]-(neighbor:KnowledgeItem) "
                 "WHERE length(p)<=$hops AND $role IN neighbor.allowed_roles "
                 "RETURN DISTINCT neighbor ORDER BY neighbor.document,neighbor.page LIMIT 12",
                 ids=seeds, role=role, hops=hops,
@@ -596,8 +802,13 @@ def search(query, role, top_k=5, history=None, max_hops=None):
                 fused[chunk_id] = {
                     'id': chunk_id, 'chunk_id': chunk_id,
                     'document_id': node.get('document_id', ''), 'document': node['document'],
-                    'page': int(node['page']), 'kind': node['kind'], 'text': node['text'],
-                    'asset_path': node.get('asset_path', ''),
+                    'page': int(node['page']), 'kind': node['kind'],
+                    'content_type': node.get('content_type', node['kind']), 'text': node['text'],
+                    'asset_path': node.get('asset_path', ''), 'file_path': node.get('file_path', node.get('asset_path', '')),
+                    'caption': node.get('caption', ''), 'section': node.get('section', ''),
+                    'section_key': node.get('section_key', ''), 'latex': node.get('latex', ''),
+                    'docling_ref': node.get('docling_ref', ''), 'bbox_json': node.get('bbox_json', ''),
+                    'provenance_json': node.get('provenance_json', ''), 'table_json': node.get('table_json', ''),
                     'allowed_roles': list(node.get('allowed_roles', [])),
                     'score': 0.31, 'rrf_score': 0.0, 'graph_expanded': True,
                 }
@@ -610,26 +821,37 @@ def search(query, role, top_k=5, history=None, max_hops=None):
 
 
 def agentic_search(query, role, top_k=5, history=None):
-    """Bounded deterministic query decomposition with hybrid retrieval and graph expansion."""
-    facets = [part.strip() for part in re.split(r'\b(?:and also|and|also|plus)\b|;', query, flags=re.I) if len(part.strip()) > 2]
-    queries = list(dict.fromkeys([query] + [part for part in facets if part.lower() != query.lower()]))[:3]
+    """Plan up to four modality-specific searches and merge their authorized evidence."""
+    plan = plan_query(query)
+    tasks = plan.get("tasks", [])[:4]
     merged = {}
     denied = False
-    for step, subquery in enumerate(queries):
-        hits, blocked = search(subquery, role, top_k, history=history, max_hops=min(GRAPH_MAX_HOPS, 2))
+    task_trace = []
+    for task in tasks:
+        subquery = task.get("query") or query
+        kinds = task.get("content_types") or ["text"]
+        hits, blocked = search(
+            subquery, role, top_k, history=history,
+            max_hops=min(GRAPH_MAX_HOPS, 2), content_types=kinds,
+        )
         denied = denied or blocked
+        task_trace.append({
+            "query": subquery, "content_types": kinds,
+            "hits": len(hits), "restricted_match": bool(blocked),
+        })
         for hit in hits:
-            key = hit['id']
-            if key not in merged or hit.get('rrf_score', 0) > merged[key].get('rrf_score', 0):
+            key = hit["id"]
+            if key not in merged or hit.get("rrf_score", 0) > merged[key].get("rrf_score", 0):
                 merged[key] = hit
-        current = list(merged.values())
-        if current and has_evidence_overlap(subquery, current):
-            continue
-        if step >= 2:
-            break
-    result = sorted(merged.values(), key=lambda item: item.get('rrf_score', 0), reverse=True)[:top_k]
-    return result, denied, {'rounds': len(queries), 'graph_hops': min(GRAPH_MAX_HOPS, 2)}
-
+    result = sorted(
+        merged.values(), key=lambda item: item.get("rrf_score", 0), reverse=True
+    )[:top_k]
+    return result, denied, {
+        "rounds": len(tasks), "graph_hops": min(GRAPH_MAX_HOPS, 2),
+        "planner": plan.get("planner", "heuristic"),
+        "requested_types": plan.get("requested_types", ["text"]),
+        "tasks": task_trace,
+    }
 
 def has_evidence_overlap(query, passages):
     terms = {term for term in re.findall(r'[a-z0-9]+', query.lower()) if len(term) > 2 and term not in _QUERY_STOPWORDS}

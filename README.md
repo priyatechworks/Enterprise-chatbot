@@ -1,42 +1,45 @@
 # Enterprise Graph RAG demo
 
-An extension of the existing Streamlit + FastAPI chatbot. It ingests multiple PDFs, parses structured content with Docling HybridChunker, stores role-scoped chunks and vectors in Neo4j, and retrieves with a hybrid Neo4j vector + Lucene BM25 path fused by reciprocal rank fusion. SQLite stores application sessions and a synchronized document catalog. The app remains one Streamlit frontend and one FastAPI backend.
+A multimodal Agentic RAG demo for the research paper **Attention Is All You Need**. It ingests PDFs with Docling, separates text, tables, formulas and figures, preserves item-level page/section/provenance metadata, and indexes text and figure vectors in Neo4j. A bounded query planner routes each question to the requested content types; Neo4j vector search + Lucene BM25 + RRF + graph expansion gather the evidence. SQLite stores sessions and the document catalog. The app remains one Streamlit frontend and one FastAPI backend.
 
 ## Architecture and runtime flow
 
 ```mermaid
-flowchart LR
-  Admin[Admin uploads PDF + selects access] --> API[FastAPI upload endpoint]
-  API --> Validate[PDF type, size, classification checks]
-  Validate --> Parse[Docling: selectable text, FAST tables, HybridChunker]
-  Parse -->|parse failure| Fallback[PyMuPDF + model-tokenizer fallback]
-  Parse --> Embed[Nomic Text document embeddings in batches]
-  Fallback --> Embed
-  Embed --> Neo[(Neo4j: Document + KnowledgeItem + vector/full-text indexes)]
-  Neo --> Links[HAS_ITEM + NEXT + optional semantic KG]
-  API --> Catalog[(SQLite document catalog, sessions, limits)]
-  User[Admin or Employee] --> UI[Streamlit chat]
-  UI --> Ask[FastAPI /ask: token, role, session, guardrails]
-  Ask --> Vector[Neo4j vector candidates with Cypher ACL]
-  Ask --> BM25[Neo4j full-text BM25 candidates with Cypher ACL]
-  Vector --> RRF[Deduplicate by chunk ID + RRF]
-  BM25 --> RRF
-  RRF --> Expand[Authorized graph expansion; optional CrossEncoder]
-  Expand --> Gate[Evidence sufficiency + injection checks]
-  Gate -->|supported evidence| LLM[Optional OpenAI-compatible answer API]
-  Gate -->|insufficient evidence| Abstain[Grounded abstention]
-  LLM --> Response[Answer + filename/page citations]
-  Abstain --> Response
-  Response --> UI
+flowchart TB
+  PDF[Transformer research PDF] --> Docling[Docling + HybridChunker]
+  Docling --> Text[Text chunks]
+  Docling --> Tables[Tables + structured JSON]
+  Docling --> Formulas[Formula items / optional LaTeX enrichment]
+  Docling --> Figures[Figure crops + captions]
+  Figures --> Gemini[Optional Gemini descriptions]
+  Text --> NomicText[Nomic Text embeddings]
+  Tables --> NomicText
+  Formulas --> NomicText
+  Gemini --> NomicText
+  Figures --> NomicVision[Nomic Vision embeddings]
+  NomicText --> Neo4j[Neo4j vector + BM25 + typed graph]
+  NomicVision --> Neo4j
+  Text --> Manifest[Per-item metadata and artifacts]
+  Tables --> Manifest
+  Formulas --> Manifest
+  Figures --> Manifest
+  User[User question] --> Planner[Agent query planner]
+  Planner --> Router[Text / table / figure / formula router]
+  Router --> Retrieval[Neo4j vector + BM25]
+  Retrieval --> ACL[Cypher role filter]
+  ACL --> RRF[RRF + graph expansion]
+  RRF --> Gate[Evidence and safety gate]
+  Gate --> LLM[Grounded answer model]
+  LLM --> Response[Answer + citations + media]
 ```
 
 1. Admin uploads PDFs through Streamlit. The backend checks file type, header, size, and the selected `Public` or `Admin-only` classification. The default is `Admin-only`.
 2. Docling parses the PDF. HybridChunker keeps heading context, page provenance, and table headers. The existing manifest remains useful for initial sample-folder documents, but user uploads do not need a manifest row.
-3. Text/table chunks are embedded with Nomic Embed Text v1.5 using `search_document:`. Query embeddings use `search_query:`. Neo4j stores a stable document ID, unique chunk IDs, policy roles, page/type, content, and embeddings. Picture, OCR, page-image, and formula processing are disabled by default for speed and can be enabled in configuration.
-4. Neo4j vector candidates and its Lucene full-text BM25 candidates are each role-filtered before passage text returns. The app combines rankings with RRF using `1 / (60 + rank)`, deduplicates by the shared chunk ID, optionally reranks only authorized candidates, then follows bounded graph links.
+3. Text, table and formula records use Nomic Embed Text v1.5; extracted figures use Nomic Embed Vision v1.5. These v1.5 encoders share a 768-dimensional space, so natural-language queries can retrieve figure vectors from the same Neo4j vector index. Text/table/formula/metadata artifacts are persisted under `data/extracted/`; figure crops remain under `data/assets/`. Every item retains its type, page, section, caption, Docling reference, bounding box/provenance and file path. Picture extraction is enabled by default; Gemini descriptions require `GEMINI_API_KEY`. Formula enrichment and OCR remain opt-in.
+4. The query planner creates up to four modality-specific retrieval tasks for text, tables, figures and formulas. Each task uses role-filtered Neo4j vector + Lucene BM25, RRF and authorized graph expansion. Figure vectors are searchable through the shared Nomic text/vision embedding space. Typed `Section` and `KnowledgeItem` nodes are linked by `HAS_SECTION`, `HAS_CONTENT`, `CONTAINS_*`, `NEXT` and source-grounded `RELATED_ON_PAGE` relationships.
 5. The evidence gate and prompt-injection checks run before answer generation. The LLM receives only authorized evidence and prior user questions for reference resolution; previous assistant answers are excluded so old answers cannot bypass a changed ACL. The response cites the source filename and PDF page, or abstains.
 
-The current retrieval controller is a small bounded Python loop, not LangGraph. A future optional LangGraph implementation can express Question Analysis -> Retrieval -> Evidence Validation -> Conditional Retry -> Answer Generation -> Final Response. It is intentionally not a runtime dependency for the Stage 1 demo.
+The current controller is a bounded Python query planner, not LangGraph. When the configured LLM is available, it returns a structured JSON retrieval plan; otherwise deterministic keyword rules route the request. LangGraph is not required for this implementation.
 
 ## Access policies and document replacement
 
@@ -62,7 +65,7 @@ $env:HF_HOME=(Resolve-Path data\model_cache).Path
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` if you do not already have a local `.env`. Set `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` and a long random `TOKEN_SECRET`. Set `DEMO_PASSWORD` to the shared demo password you want. To generate prose instead of a retrieval excerpt, configure an approved OpenAI-compatible `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL`. Never commit `.env` or uploaded customer documents.
+Copy `.env.example` to `.env` if you do not already have a local `.env`. Set `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` and a long random `TOKEN_SECRET`. Set `DEMO_PASSWORD` to the demo password you want. Configure an approved OpenAI-compatible `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` for query planning and grounded answer generation. Add `GEMINI_API_KEY` for figure descriptions (optional; captions are used otherwise). Set `DOCLING_ENABLE_FORMULA_ENRICHMENT=true` only when ready to test Docling's formula model. Never commit `.env` or uploaded documents.
 
 ## Run the application
 
@@ -82,7 +85,7 @@ Terminal 2 - Streamlit:
 
 Open the local URL printed by Streamlit (usually `http://localhost:8501`). Sign in as `admin` to upload PDFs and choose access, or sign in as `employee` to query Public documents. Initial demo credentials come from `DEMO_PASSWORD` in `.env` (the code fallback is `RagDemo!2026`). To index the seeded sample, use the Admin sidebar action **Import sample_docs folder**. New uploads can be indexed at any time with **Upload multiple PDFs**.
 
-Ingestion result rows report indexed/failed status, document ID, classification, pages, chunk/table/image counts, parser path, and errors. When optional picture extraction is enabled, pictures use Nomic Vision embeddings; otherwise text/table retrieval remains the fast default.
+Ingestion result rows report indexed/failed status, document ID, classification, pages, counts by content type, artifact locations, parser path and warnings. Figure crops use Nomic Vision embeddings; Gemini adds a searchable visual description when configured, otherwise the extracted caption is used.
 
 ## Performance and optional parsing
 
@@ -98,9 +101,9 @@ The default setup favors a quick first pass:
 | `DOCLING_ENABLE_OCR` | `false` | Enable OCR for scanned PDFs when needed. |
 | `DOCLING_ENABLE_FORMULA_ENRICHMENT` | `false` | Optional Docling formula enrichment. |
 | `DOCLING_GENERATE_PAGE_IMAGES` | `false` | Optional full-page image generation. |
-| `DOCLING_EXTRACT_PICTURES` | `false` | Optional picture crops and Nomic Vision embeddings. |
+| `DOCLING_EXTRACT_PICTURES` | `true` | Extract figure crops and create Nomic Vision embeddings. |
 
-Docling table recognition is always enabled in FAST mode. PyMuPDF remains the text-only fallback. CrossEncoder uses `CROSS_ENCODER_MODEL` (default `cross-encoder/ms-marco-MiniLM-L-6-v2`) and only reranks evidence that already passed Neo4j ACL filtering. Model instances are cached in process; downloads are not repeated after they are available in `data/model_cache`.
+Docling table recognition is always enabled in FAST mode. Formula enrichment is opt-in with `DOCLING_ENABLE_FORMULA_ENRICHMENT=true`; the setting invokes Docling's extra formula model and should be validated on the target paper. `GEMINI_API_KEY` enables Gemini figure descriptions, while the caption-only fallback works without it. `AGENT_PLANNER_ENABLED=true` enables an LLM-backed JSON planner when the OpenAI-compatible endpoint is configured; otherwise the heuristic planner is used. PyMuPDF remains the text-only fallback. CrossEncoder only reranks evidence that already passed Neo4j ACL filtering. Models are cached in process and in `data/model_cache`.
 
 ## Evaluation and tests
 
@@ -129,7 +132,7 @@ Ragas evaluation sends the sample questions, generated answers, and authorized r
 
 - Neo4j is required for live ingestion and retrieval. Automated tests use mocks and do not establish real AuraDB availability or production ACL isolation.
 - The current paper/evaluation set is a small demo corpus; quality numbers are not general benchmarks.
-- Formula enrichment, OCR, page images, and picture extraction are off by default. Formula extraction accuracy requires separate validation.
+- Formula enrichment and OCR are opt-in. Figure crops are enabled by default; Gemini descriptions are optional and fall back to the source caption. Validate formula and figure extraction against the target PDF before relying on them.
 - PII detection reports regex matches; it does not redact them. Prompt-injection checks are pattern-based demo guardrails.
 - Ingestion runs synchronously. SQLite session and rate-limit state is intended for a single host; multi-replica deployment needs shared state.
 - This demo uses local shared-password identities. Add SSO, managed secrets, audit/retention, malware scanning, OCR quality evaluation, durable ingestion workers, and monitoring before production use.
