@@ -8,6 +8,11 @@ DOCS_DIR = DATA_DIR / "sample_docs"
 UPLOAD_DIR = DATA_DIR / "documents"
 TMP_DIR = DATA_DIR / "tmp"
 ASSET_DIR = DATA_DIR / "assets"
+EXTRACTED_DIR = DATA_DIR / "extracted"
+TEXT_DIR = EXTRACTED_DIR / "text"
+TABLE_DIR = EXTRACTED_DIR / "tables"
+FORMULA_DIR = EXTRACTED_DIR / "formulas"
+METADATA_DIR = EXTRACTED_DIR / "metadata"
 MODEL_CACHE_DIR = DATA_DIR / "model_cache"
 DB_PATH = DATA_DIR / "rag_demo.sqlite3"
 MANIFEST_PATH = DOCS_DIR / "role_access_manifest.csv"
@@ -32,6 +37,9 @@ EMBEDDING_DIMENSION = 768
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
+AGENT_PLANNER_ENABLED = _env_bool("AGENT_PLANNER_ENABLED", True)
 DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "RagDemo!2026")
 TOKEN_SECRET = os.getenv("TOKEN_SECRET", "local-demo-only-change-before-deployment")
 RETRIEVAL_THRESHOLD = float(os.getenv("RETRIEVAL_THRESHOLD", "0.30"))
@@ -41,7 +49,7 @@ USER_MAX_SESSIONS = int(os.getenv("USER_MAX_SESSIONS", "5"))
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 GRAPH_MAX_HOPS = int(os.getenv("GRAPH_MAX_HOPS", "2"))
-for folder in (DOCS_DIR, ASSET_DIR, MODEL_CACHE_DIR):
+for folder in (DOCS_DIR, ASSET_DIR, EXTRACTED_DIR, TEXT_DIR, TABLE_DIR, FORMULA_DIR, METADATA_DIR, MODEL_CACHE_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 for folder in (UPLOAD_DIR, TMP_DIR):
     folder.mkdir(parents=True, exist_ok=True)
@@ -58,4 +66,4 @@ CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-M
 DOCLING_ENABLE_OCR = _env_bool("DOCLING_ENABLE_OCR", False)
 DOCLING_ENABLE_FORMULA_ENRICHMENT = _env_bool("DOCLING_ENABLE_FORMULA_ENRICHMENT", False)
 DOCLING_GENERATE_PAGE_IMAGES = _env_bool("DOCLING_GENERATE_PAGE_IMAGES", False)
-DOCLING_EXTRACT_PICTURES = _env_bool("DOCLING_EXTRACT_PICTURES", False)
+DOCLING_EXTRACT_PICTURES = _env_bool("DOCLING_EXTRACT_PICTURES", True)
