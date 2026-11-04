@@ -330,10 +330,6 @@ def _extract_docling(path, document_name, document_id=None):
 
     # Formula understanding produces TextItems labelled FORMULA. Keep them as
     # independent retrievable records in addition to their surrounding text.
-    try:
-        from docling_core.types.doc import TextItem
-    except Exception:
-        TextItem = ()
     for item, _level in document.iterate_items():
         label = str(getattr(getattr(item, "label", ""), "value", getattr(item, "label", ""))).lower()
         if label != "formula":
@@ -480,7 +476,7 @@ def _prepare_graph_rows(name, document_id, classification, roles, records):
                 if record.get("structured_data") is not None else "",
             "latex": str(record.get("latex") or ""),
             "description_warning": str(record.get("description_warning") or ""),
-            "ordinal": ordinal, "embedding": vector.tolist(),
+            "ordinal": ordinal, "embedding": vector.tolist() if hasattr(vector, "tolist") else list(vector),
         })
     return rows
 
