@@ -106,13 +106,12 @@ def persist_extracted_records(document_id, document_name, page_count, classifica
     text_path = TEXT_DIR / f"{document_key}_chunks.jsonl"
     formula_path = FORMULA_DIR / f"{document_key}_formulas.jsonl"
     manifest_path = METADATA_DIR / f"{document_key}_items.jsonl"
-    _write_jsonl(text_path, text_rows)
-    _write_jsonl(formula_path, formula_rows)
-
     for record in text_rows:
         record["file_path"] = str(text_path.resolve())
     for record in formula_rows:
         record["file_path"] = str(formula_path.resolve())
+    _write_jsonl(text_path, text_rows)
+    _write_jsonl(formula_path, formula_rows)
     for row in manifest_rows:
         if row["content_type"] == "text":
             row["file_path"] = str(text_path.resolve())
