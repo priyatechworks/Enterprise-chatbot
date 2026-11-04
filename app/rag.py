@@ -71,52 +71,56 @@ def driver():
     return _driver
 
 
-def _vector_query(session, query_vector, role, limit, candidate_limit, restricted=False):
+def _vector_query(session, query_vector, role, limit, candidate_limit, restricted=False, kinds=None):
+    kinds = kinds or ["text", "table", "figure", "formula"]
     if _neo4j_supports_search:
         authorization = 'NOT $role IN node.allowed_roles' if restricted else '$role IN node.allowed_roles'
         similarity = ' AND score>=0.34' if restricted else ''
         return list(session.run(
             'CYPHER 25 MATCH (node:KnowledgeItem) '
             'SEARCH node IN (VECTOR INDEX knowledge_embedding FOR $embedding LIMIT $limit) SCORE AS score '
-            f'WHERE {authorization}{similarity} '
+            f'WHERE {authorization} AND node.kind IN $kinds{similarity} '
             + ('RETURN score ORDER BY score DESC LIMIT 1' if restricted else 'RETURN node,score ORDER BY score DESC LIMIT $candidate_limit'),
-            embedding=query_vector, limit=limit, candidate_limit=candidate_limit, role=role,
+            embedding=query_vector, limit=limit, candidate_limit=candidate_limit, role=role, kinds=kinds,
         ))
     if restricted:
         return list(session.run(
             "CALL db.index.vector.queryNodes('knowledge_embedding',$limit,$embedding) YIELD node,score "
-            "WHERE NOT $role IN node.allowed_roles AND score>=0.34 RETURN score ORDER BY score DESC LIMIT 1",
-            limit=limit, embedding=query_vector, role=role,
+            "WHERE NOT $role IN node.allowed_roles AND node.kind IN $kinds AND score>=0.34 "
+            "RETURN score ORDER BY score DESC LIMIT 1",
+            limit=limit, embedding=query_vector, role=role, kinds=kinds,
         ))
     return list(session.run(
         "CALL db.index.vector.queryNodes('knowledge_embedding',$limit,$embedding) YIELD node,score "
-        "WHERE $role IN node.allowed_roles RETURN node,score ORDER BY score DESC LIMIT $candidate_limit",
-        limit=limit, candidate_limit=candidate_limit, embedding=query_vector, role=role,
+        "WHERE $role IN node.allowed_roles AND node.kind IN $kinds "
+        "RETURN node,score ORDER BY score DESC LIMIT $candidate_limit",
+        limit=limit, candidate_limit=candidate_limit, embedding=query_vector, role=role, kinds=kinds,
     ))
 
-
-def _fulltext_query(session, lucene_query, role, limit, candidate_limit, restricted=False):
+def _fulltext_query(session, lucene_query, role, limit, candidate_limit, restricted=False, kinds=None):
+    kinds = kinds or ["text", "table", "figure", "formula"]
     if _neo4j_supports_fulltext_search:
         authorization = 'NOT $role IN node.allowed_roles' if restricted else '$role IN node.allowed_roles'
         return list(session.run(
             'CYPHER 25 MATCH (node:KnowledgeItem) '
             'SEARCH node IN (FULLTEXT INDEX knowledge_text FOR $lucene_query LIMIT $limit) SCORE AS score '
-            f'WHERE {authorization} '
+            f'WHERE {authorization} AND node.kind IN $kinds '
             + ('RETURN score ORDER BY score DESC LIMIT 1' if restricted else 'RETURN node,score ORDER BY score DESC LIMIT $candidate_limit'),
-            lucene_query=lucene_query, limit=limit, candidate_limit=candidate_limit, role=role,
+            lucene_query=lucene_query, limit=limit, candidate_limit=candidate_limit, role=role, kinds=kinds,
         ))
     if restricted:
         return list(session.run(
             "CALL db.index.fulltext.queryNodes('knowledge_text',$lucene_query,{limit:$limit}) YIELD node,score "
-            "WHERE NOT $role IN node.allowed_roles RETURN score ORDER BY score DESC LIMIT 1",
-            lucene_query=lucene_query, limit=limit, role=role,
+            "WHERE NOT $role IN node.allowed_roles AND node.kind IN $kinds "
+            "RETURN score ORDER BY score DESC LIMIT 1",
+            lucene_query=lucene_query, limit=limit, role=role, kinds=kinds,
         ))
     return list(session.run(
         "CALL db.index.fulltext.queryNodes('knowledge_text',$lucene_query,{limit:$limit}) YIELD node,score "
-        "WHERE $role IN node.allowed_roles RETURN node,score ORDER BY score DESC LIMIT $candidate_limit",
-        lucene_query=lucene_query, limit=limit, candidate_limit=candidate_limit, role=role,
+        "WHERE $role IN node.allowed_roles AND node.kind IN $kinds "
+        "RETURN node,score ORDER BY score DESC LIMIT $candidate_limit",
+        lucene_query=lucene_query, limit=limit, candidate_limit=candidate_limit, role=role, kinds=kinds,
     ))
-
 
 def text_model():
     global _text_model
