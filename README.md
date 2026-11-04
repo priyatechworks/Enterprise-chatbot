@@ -36,8 +36,8 @@ flowchart TB
 1. Admin uploads PDFs through Streamlit. The backend checks file type, header, size, and the selected `Public` or `Admin-only` classification. The default is `Admin-only`.
 2. Docling parses the PDF. HybridChunker keeps heading context, page provenance, and table headers. The existing manifest remains useful for initial sample-folder documents, but user uploads do not need a manifest row.
 3. Text, table and formula records use Nomic Embed Text v1.5; extracted figures use Nomic Embed Vision v1.5. These v1.5 encoders share a 768-dimensional space, so natural-language queries can retrieve figure vectors from the same Neo4j vector index. Text/table/formula/metadata artifacts are persisted under `data/extracted/`; figure crops remain under `data/assets/`. Every item retains its type, page, section, caption, Docling reference, bounding box/provenance and file path. Picture extraction is enabled by default; Gemini descriptions require `GEMINI_API_KEY`. Formula enrichment and OCR remain opt-in.
-4. The query planner creates up to four modality-specific retrieval tasks for text, tables, figures and formulas. Each task uses role-filtered Neo4j vector + Lucene BM25, RRF and authorized graph expansion. Figure vectors are searchable through the shared Nomic text/vision embedding space. Typed `Section` and `KnowledgeItem` nodes are linked by `HAS_SECTION`, `HAS_CONTENT`, `CONTAINS_*`, `NEXT` and source-grounded `RELATED_ON_PAGE` relationships.
-5. The evidence gate and prompt-injection checks run before answer generation. The LLM receives only authorized evidence and prior user questions for reference resolution; previous assistant answers are excluded so old answers cannot bypass a changed ACL. The response cites the source filename and PDF page, or abstains.
+4. The query planner creates a separate retrieval task for each requested type: text, tables, figures and formulas. Each task searches only that type with role-filtered Neo4j vector + Lucene BM25, RRF and authorized graph expansion. The merge reserves coverage for the strongest available requested types and returns at most three chunks overall. Typed `Section` and `KnowledgeItem` nodes are linked by `HAS_SECTION`, `HAS_CONTENT`, `CONTAINS_*`, `NEXT` and source-grounded `RELATED_ON_PAGE` relationships.
+5. The evidence gate and prompt-injection checks run before answer generation. The OpenAI answer model receives at most three authorized items: text and table data as text, formulas as LaTeX, and selected figure crops as actual image inputs. Prior user questions are supplied only for reference resolution; previous assistant answers are excluded. The response cites the source filename and PDF page, or abstains.
 
 The current controller is a bounded Python query planner, not LangGraph. When the configured LLM is available, it returns a structured JSON retrieval plan; otherwise deterministic keyword rules route the request. LangGraph is not required for this implementation.
 
@@ -65,7 +65,7 @@ $env:HF_HOME=(Resolve-Path data\model_cache).Path
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` if you do not already have a local `.env`. Set `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` and a long random `TOKEN_SECRET`. Set `DEMO_PASSWORD` to the demo password you want. Configure an approved OpenAI-compatible `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` for query planning and grounded answer generation. Add `GEMINI_API_KEY` for figure descriptions (optional; captions are used otherwise). Set `DOCLING_ENABLE_FORMULA_ENRICHMENT=true` only when ready to test Docling's formula model. Never commit `.env` or uploaded documents.
+Copy `.env.example` to `.env` if you do not already have a local `.env`. Set `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` and a long random `TOKEN_SECRET`. Set `DEMO_PASSWORD` to the demo password you want. Set `LLM_API_KEY` for the OpenAI API. The default endpoint is `https://api.openai.com/v1` and the default vision-capable model is `gpt-4o-mini`; `LLM_BASE_URL` and `LLM_MODEL` can override these defaults. Add `GEMINI_API_KEY` for figure descriptions (optional; captions are used otherwise). Set `DOCLING_ENABLE_FORMULA_ENRICHMENT=true` only when ready to test Docling's formula model. Never commit `.env` or uploaded documents.
 
 ## Run the application
 
@@ -99,11 +99,11 @@ The default setup favors a quick first pass:
 | `MAX_UPLOAD_MB` | `25` | Upload size limit. |
 | `CROSS_ENCODER_ENABLED` | `false` | Load the CrossEncoder only when enabled. |
 | `DOCLING_ENABLE_OCR` | `false` | Enable OCR for scanned PDFs when needed. |
-| `DOCLING_ENABLE_FORMULA_ENRICHMENT` | `false` | Optional Docling formula enrichment. |
+| `DOCLING_ENABLE_FORMULA_ENRICHMENT` | `true` | Docling formula enrichment for the research-paper demo. |
 | `DOCLING_GENERATE_PAGE_IMAGES` | `false` | Optional full-page image generation. |
 | `DOCLING_EXTRACT_PICTURES` | `true` | Extract figure crops and create Nomic Vision embeddings. |
 
-Docling table recognition is always enabled in FAST mode. Formula enrichment is opt-in with `DOCLING_ENABLE_FORMULA_ENRICHMENT=true`; the setting invokes Docling's extra formula model and should be validated on the target paper. `GEMINI_API_KEY` enables Gemini figure descriptions, while the caption-only fallback works without it. `AGENT_PLANNER_ENABLED=true` enables an LLM-backed JSON planner when the OpenAI-compatible endpoint is configured; otherwise the heuristic planner is used. PyMuPDF remains the text-only fallback. CrossEncoder only reranks evidence that already passed Neo4j ACL filtering. Models are cached in process and in `data/model_cache`.
+Docling table recognition is always enabled in FAST mode. Formula enrichment is enabled by default for this demo; it invokes Docling's extra formula model and should be validated on the target paper. `GEMINI_API_KEY` enables Gemini figure descriptions, while the caption-only fallback works without it. `AGENT_PLANNER_ENABLED=true` enables an LLM-backed JSON planner when the OpenAI-compatible endpoint is configured; otherwise the heuristic planner is used. PyMuPDF remains the text-only fallback. CrossEncoder only reranks evidence that already passed Neo4j ACL filtering. Models are cached in process and in `data/model_cache`.
 
 ## Evaluation and tests
 
@@ -143,3 +143,11 @@ Ragas evaluation sends the sample questions, generated answers, and authorized r
 Set `RAG_DEBUG_TRACE=true` in your local, uncommitted `.env` file and restart FastAPI and Streamlit. Each chat request then prints a `[RAG_DEBUG_TRACE]` JSON event to the FastAPI terminal and shows a **Developer trace · every retrieval step** expander in Streamlit. It includes the plan, modality filters, vector/BM25 candidate records, scores, graph neighbors, evidence-gate decisions, answer context, LLM errors, asset/file paths, timestamps and stage timings. The trace can contain full retrieved document text; use it only with demo or data you are allowed to inspect, and turn it off before production.
 
 Formula enrichment is enabled by default in `app.config`; add `DOCLING_ENABLE_FORMULA_ENRICHMENT=true` to `.env` to make the setting explicit. Re-ingest the PDF after changing extraction settings. Check the ingestion response for the `formulas` count and its extraction trace before investigating retrieval.
+
+## Modality-wise question answering and developer console
+
+- Every query is planned into separate type-specific searches. A figure search cannot return text/formula items, and the same holds for the other modalities.
+- Each modality pass can retrieve candidates, but the final answer context is capped at **three chunks total**. When multiple types were requested, the merge first reserves the best available item from each type, then fills remaining slots by ranking.
+- The OpenAI request receives text, table JSON and LaTeX as text. For each selected figure, the backend reads the extracted crop and attaches it as an image input to the vision-capable OpenAI Chat Completions request. A caption alone is not treated as equivalent to an image.
+- Set `RAG_DEBUG_TRACE=true` locally to view the planner, type-specific retrieval, scores, final top-three selection, file paths, actual image attachment status, answer context and per-stage timings in the Streamlit **Developer console**. The console can show document content and local file paths; use demo documents only and disable it before a normal demo.
+- The default answer model is `gpt-4o-mini`. Set `LLM_API_KEY` in the local `.env`; do not commit or share it. The planner and answer model both use the configured OpenAI endpoint/model.
