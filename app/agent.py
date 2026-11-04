@@ -13,9 +13,9 @@ def heuristic_plan(question: str) -> dict:
     kinds = {"text"}
     if re.search(r"\b(table|tabular|results?|benchmark|bleu|accuracy|score|comparison|performance|metrics?)\b", lower):
         kinds.add("table")
-    if re.search(r"\b(figure|diagram|image|visual|architecture|flowchart|illustration|show me|display)\b", lower):
+    if re.search(r"\b(figures?|diagrams?|images?|visuals?|architecture|flowcharts?|illustrations?|show me|display)\b", lower):
         kinds.add("figure")
-    if re.search(r"\b(formula|equation|mathematical|math|derive|scaled dot|softmax|q\s*[,/]\s*k)\b", lower):
+    if re.search(r"\b(formulas?|equations?|mathematical|math|derive|scaled dot|softmax|q\s*[,/]\s*k)\b", lower):
         kinds.add("formula")
     return {
         "tasks": [{"query": question.strip(), "content_types": [kind]}
