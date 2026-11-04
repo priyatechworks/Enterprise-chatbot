@@ -19,7 +19,7 @@ init_db()
 
 class AskRequest(BaseModel):
     question:str=Field(min_length=2,max_length=1500)
-    top_k:int=Field(default=5,ge=1,le=10)
+    top_k:int=Field(default=3,ge=1,le=3)
     session_id:str|None=None
 class LoginRequest(BaseModel):username:str;password:str
 
