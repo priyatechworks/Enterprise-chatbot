@@ -26,35 +26,46 @@ def heuristic_plan(question: str) -> dict:
 
 
 def _normalise_plan(payload: dict, question: str) -> dict:
+    """Expand multi-type plans into independent, modality-specific searches."""
     tasks = []
-    for item in payload.get("tasks", [])[:4]:
+    seen = set()
+    for item in payload.get("tasks", [])[:8]:
         if not isinstance(item, dict):
             continue
         query = str(item.get("query") or question).strip()[:1000]
         kinds = [str(kind).lower() for kind in item.get("content_types", [])
                  if str(kind).lower() in VALID_TYPES]
-        if query and kinds:
-            tasks.append({"query": query, "content_types": list(dict.fromkeys(kinds))})
+        for kind in kinds:
+            key = (query, kind)
+            if query and key not in seen:
+                tasks.append({"query": query, "content_types": [kind]})
+                seen.add(key)
     if not tasks:
         return heuristic_plan(question)
-    requested = sorted({kind for task in tasks for kind in task["content_types"]})
-    if "text" not in requested:
-        tasks.insert(0, {"query": question, "content_types": ["text"]})
-        requested.append("text")
-    return {"tasks": tasks[:4], "requested_types": requested, "planner": "llm"}
-
+    if not any(task["content_types"] == ["text"] for task in tasks):
+        tasks.insert(0, {"query": question.strip(), "content_types": ["text"]})
+    tasks = tasks[:4]
+    requested = []
+    for task in tasks:
+        kind = task["content_types"][0]
+        if kind not in requested:
+            requested.append(kind)
+    return {"tasks": tasks, "requested_types": requested, "planner": "llm"}
 
 def plan_query(question: str) -> dict:
     """Use an LLM JSON plan when configured; always fall back to deterministic routing."""
     fallback = heuristic_plan(question)
     if not (AGENT_PLANNER_ENABLED and LLM_API_KEY and LLM_BASE_URL and LLM_MODEL):
+        fallback["planner_reason"] = "Heuristic routing used because planner is disabled or OpenAI configuration is incomplete."
         return fallback
     system_prompt = (
         "You are a query planner for a research-paper chatbot. Do not answer the question. "
-        "Return JSON only: {tasks:[{query:string,content_types:[text|table|figure|formula]}]}. "
+        "Return JSON only: {tasks:[{query:string,content_types:[one type only]}]}. "
         "Always include text. Add table for requested numeric/table evidence, figure for requested "
         "diagram/visual/architecture and formula for requested mathematical expressions. "
-        "Use at most four focused tasks. Do not invent facts."
+        "Create a separate task for each requested type; never group multiple types in one task. " +
+        "Use at most four focused tasks. Include text and add table for numeric/table evidence, " +
+        "figure for diagrams/architecture/visual explanation, and formula for equations or mathematical notation. Do not invent facts."
     )
     payload = {"model": LLM_MODEL, "temperature": 0, "messages": [
         {"role": "system", "content": system_prompt},
@@ -68,6 +79,9 @@ def plan_query(question: str) -> dict:
         response.raise_for_status()
         raw = response.json()["choices"][0]["message"]["content"]
         raw = re.sub(r"^\s*```(?:json)?|```\s*$", "", str(raw).strip(), flags=re.I)
-        return _normalise_plan(json.loads(raw), question)
-    except Exception:
+        plan = _normalise_plan(json.loads(raw), question)
+        plan["planner_reason"] = "OpenAI query planner returned a validated modality plan."
+        return plan
+    except Exception as exc:
+        fallback["planner_reason"] = f"OpenAI query planner failed ({type(exc).__name__}); deterministic routing used."
         return fallback
