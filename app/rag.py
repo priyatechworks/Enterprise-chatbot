@@ -282,6 +282,7 @@ def _extract_docling(path, document_name, document_id=None):
     result = _docling_converter_for_settings().convert(path)
     document = result.document
     records = []
+    page_headings = {}
     chunker = _chunker()
 
     # Text and tables are chunked using Docling's layout-aware HybridChunker.
@@ -302,6 +303,9 @@ def _extract_docling(path, document_name, document_id=None):
         if not text:
             continue
         headings = list(getattr(getattr(chunk, "meta", None), "headings", []) or [])
+        if headings:
+            for page_number in (page_numbers or [page]):
+                page_headings[int(page_number)] = headings
         table_items = [
             item for item in chunk_items
             if str(getattr(getattr(item, "label", ""), "value", getattr(item, "label", ""))).lower() == "table"
@@ -345,7 +349,7 @@ def _extract_docling(path, document_name, document_id=None):
             "text": formula_text,
             "latex": formula_text,
             "caption": "",
-            "headings": [],
+            "headings": page_headings.get(page, []),
             "provenance": provenance,
             "bbox": provenance[0].get("bbox") if provenance else None,
             "docling_ref": _item_ref(item),
@@ -372,7 +376,7 @@ def _extract_docling(path, document_name, document_id=None):
                 "text": description,
                 "caption": caption,
                 "asset_path": str(target.resolve()),
-                "headings": [],
+                "headings": page_headings.get(page, []),
                 "provenance": page_prov,
                 "bbox": page_prov[0].get("bbox") if page_prov else None,
                 "docling_ref": _item_ref(picture),
@@ -393,7 +397,7 @@ def _extract_docling(path, document_name, document_id=None):
             records.append({
                 "kind": "figure", "page": int(page_number), "text": description,
                 "caption": f"Full page image from {document_name}, page {page_number}",
-                "asset_path": str(target.resolve()), "headings": [],
+                "asset_path": str(target.resolve()), "headings": page_headings.get(int(page_number), []),
                 "provenance": [{"page_no": int(page_number), "bbox": None}],
                 "bbox": None, "docling_ref": "", "description_warning": description_warning,
             })
