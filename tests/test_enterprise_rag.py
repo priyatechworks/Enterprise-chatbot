@@ -468,10 +468,8 @@ def test_agentic_search_returns_balanced_global_top_three(monkeypatch):
 
 
 def test_generator_attaches_retrieved_figure_as_openai_image(monkeypatch, tmp_path):
-    from PIL import Image
-
     image_path = tmp_path / "diagram.png"
-    Image.new("RGB", (24, 24), (20, 80, 120)).save(image_path)
+    image_path.write_bytes(b"test-image-bytes")
     observed = {}
 
     class FakeResponse:
@@ -491,6 +489,7 @@ def test_generator_attaches_retrieved_figure_as_openai_image(monkeypatch, tmp_pa
     monkeypatch.setattr(generation, "LLM_API_KEY", "test-key")
     monkeypatch.setattr(generation, "LLM_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setattr(generation, "LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setattr(generation, "_image_data_url", lambda path: "data:image/jpeg;base64,dGVzdA==")
     monkeypatch.setattr(generation.requests, "post", fake_post)
     trace = RequestTrace(enabled=True)
     text, mode = generation.answer(
