@@ -132,7 +132,14 @@ Ragas evaluation sends the sample questions, generated answers, and authorized r
 
 - Neo4j is required for live ingestion and retrieval. Automated tests use mocks and do not establish real AuraDB availability or production ACL isolation.
 - The current paper/evaluation set is a small demo corpus; quality numbers are not general benchmarks.
-- Formula enrichment and OCR are opt-in. Figure crops are enabled by default; Gemini descriptions are optional and fall back to the source caption. Validate formula and figure extraction against the target PDF before relying on them.
+- Formula enrichment is enabled by default for this research-paper demo; the first ingestion may download the Docling formula model. OCR remains opt-in for scanned PDFs. Figure crops are enabled by default; Gemini descriptions are optional and fall back to the source caption. Validate formula and figure extraction against the target PDF before relying on them.
 - PII detection reports regex matches; it does not redact them. Prompt-injection checks are pattern-based demo guardrails.
 - Ingestion runs synchronously. SQLite session and rate-limit state is intended for a single host; multi-replica deployment needs shared state.
 - This demo uses local shared-password identities. Add SSO, managed secrets, audit/retention, malware scanning, OCR quality evaluation, durable ingestion workers, and monitoring before production use.
+
+
+## Local developer diagnostics
+
+Set `RAG_DEBUG_TRACE=true` in your local, uncommitted `.env` file and restart FastAPI and Streamlit. Each chat request then prints a `[RAG_DEBUG_TRACE]` JSON event to the FastAPI terminal and shows a **Developer trace · every retrieval step** expander in Streamlit. It includes the plan, modality filters, vector/BM25 candidate records, scores, graph neighbors, evidence-gate decisions, answer context, LLM errors, asset/file paths, timestamps and stage timings. The trace can contain full retrieved document text; use it only with demo or data you are allowed to inspect, and turn it off before production.
+
+Formula enrichment is enabled by default in `app.config`; add `DOCLING_ENABLE_FORMULA_ENRICHMENT=true` to `.env` to make the setting explicit. Re-ingest the PDF after changing extraction settings. Check the ingestion response for the `formulas` count and its extraction trace before investigating retrieval.
