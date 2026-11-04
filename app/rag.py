@@ -727,8 +727,15 @@ def reciprocal_rank_fusion(vector_rows, keyword_rows, rrf_constant=60):
                 'id': chunk_id, 'chunk_id': chunk_id,
                 'document_id': node.get('document_id', ''),
                 'document': node['document'], 'page': int(node['page']),
-                'kind': node['kind'], 'text': node['text'],
-                'asset_path': node.get('asset_path', ''),
+                'kind': node['kind'], 'content_type': node.get('content_type', node['kind']),
+                'text': node['text'], 'asset_path': node.get('asset_path', ''),
+                'file_path': node.get('file_path', node.get('asset_path', '')),
+                'caption': node.get('caption', ''), 'section': node.get('section', ''),
+                'section_key': node.get('section_key', ''), 'latex': node.get('latex', ''),
+                'docling_ref': node.get('docling_ref', ''),
+                'bbox_json': node.get('bbox_json', ''),
+                'provenance_json': node.get('provenance_json', ''),
+                'table_json': node.get('table_json', ''),
                 'allowed_roles': list(node.get('allowed_roles', [])), 'rrf_score': 0.0,
             })
             item[f'{source}_rank'] = rank
@@ -742,22 +749,26 @@ def reciprocal_rank_fusion(vector_rows, keyword_rows, rrf_constant=60):
     return sorted(fused.values(), key=lambda item: item['rrf_score'], reverse=True)
 
 
-def search(query, role, top_k=5, history=None, max_hops=None):
+def search(query, role, top_k=5, history=None, max_hops=None, content_types=None):
+    allowed_types = list(dict.fromkeys(
+        kind for kind in (content_types or ["text", "table", "figure", "formula"])
+        if kind in {"text", "table", "figure", "formula"}
+    )) or ["text"]
     database = driver()
     query_vector = np.asarray(text_embeddings([query], query=True)[0], dtype=np.float32).tolist()
     candidate_limit = max(RETRIEVAL_CANDIDATE_K, top_k)
     index_limit = candidate_limit * 5  # over-fetch to account for inaccessible hits before ACL filtering
     keyword_query = _lucene_query(query)
     with database.session(database=NEO4J_DATABASE) as session:
-        vector_rows = _vector_query(session, query_vector, role, index_limit, candidate_limit)
+        vector_rows = _vector_query(session, query_vector, role, index_limit, candidate_limit, kinds=allowed_types)
         keyword_rows = []
         restricted_vector = []
         restricted_keyword = []
         if keyword_query:
-            keyword_rows = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit)
+            keyword_rows = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit, kinds=allowed_types)
             # These denial probes return scores only; no restricted document text or name escapes Neo4j.
-            restricted_keyword = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit, restricted=True)
-        restricted_vector = _vector_query(session, query_vector, role, index_limit, candidate_limit, restricted=True)
+            restricted_keyword = _fulltext_query(session, keyword_query, role, index_limit, candidate_limit, restricted=True, kinds=allowed_types)
+        restricted_vector = _vector_query(session, query_vector, role, index_limit, candidate_limit, restricted=True, kinds=allowed_types)
 
         ranked = reciprocal_rank_fusion(vector_rows, keyword_rows)
         fused = {item['id']: item for item in ranked}
@@ -791,8 +802,13 @@ def search(query, role, top_k=5, history=None, max_hops=None):
                 fused[chunk_id] = {
                     'id': chunk_id, 'chunk_id': chunk_id,
                     'document_id': node.get('document_id', ''), 'document': node['document'],
-                    'page': int(node['page']), 'kind': node['kind'], 'text': node['text'],
-                    'asset_path': node.get('asset_path', ''),
+                    'page': int(node['page']), 'kind': node['kind'],
+                    'content_type': node.get('content_type', node['kind']), 'text': node['text'],
+                    'asset_path': node.get('asset_path', ''), 'file_path': node.get('file_path', node.get('asset_path', '')),
+                    'caption': node.get('caption', ''), 'section': node.get('section', ''),
+                    'section_key': node.get('section_key', ''), 'latex': node.get('latex', ''),
+                    'docling_ref': node.get('docling_ref', ''), 'bbox_json': node.get('bbox_json', ''),
+                    'provenance_json': node.get('provenance_json', ''), 'table_json': node.get('table_json', ''),
                     'allowed_roles': list(node.get('allowed_roles', [])),
                     'score': 0.31, 'rrf_score': 0.0, 'graph_expanded': True,
                 }
@@ -805,26 +821,37 @@ def search(query, role, top_k=5, history=None, max_hops=None):
 
 
 def agentic_search(query, role, top_k=5, history=None):
-    """Bounded deterministic query decomposition with hybrid retrieval and graph expansion."""
-    facets = [part.strip() for part in re.split(r'\b(?:and also|and|also|plus)\b|;', query, flags=re.I) if len(part.strip()) > 2]
-    queries = list(dict.fromkeys([query] + [part for part in facets if part.lower() != query.lower()]))[:3]
+    """Plan up to four modality-specific searches and merge their authorized evidence."""
+    plan = plan_query(query)
+    tasks = plan.get("tasks", [])[:4]
     merged = {}
     denied = False
-    for step, subquery in enumerate(queries):
-        hits, blocked = search(subquery, role, top_k, history=history, max_hops=min(GRAPH_MAX_HOPS, 2))
+    task_trace = []
+    for task in tasks:
+        subquery = task.get("query") or query
+        kinds = task.get("content_types") or ["text"]
+        hits, blocked = search(
+            subquery, role, top_k, history=history,
+            max_hops=min(GRAPH_MAX_HOPS, 2), content_types=kinds,
+        )
         denied = denied or blocked
+        task_trace.append({
+            "query": subquery, "content_types": kinds,
+            "hits": len(hits), "restricted_match": bool(blocked),
+        })
         for hit in hits:
-            key = hit['id']
-            if key not in merged or hit.get('rrf_score', 0) > merged[key].get('rrf_score', 0):
+            key = hit["id"]
+            if key not in merged or hit.get("rrf_score", 0) > merged[key].get("rrf_score", 0):
                 merged[key] = hit
-        current = list(merged.values())
-        if current and has_evidence_overlap(subquery, current):
-            continue
-        if step >= 2:
-            break
-    result = sorted(merged.values(), key=lambda item: item.get('rrf_score', 0), reverse=True)[:top_k]
-    return result, denied, {'rounds': len(queries), 'graph_hops': min(GRAPH_MAX_HOPS, 2)}
-
+    result = sorted(
+        merged.values(), key=lambda item: item.get("rrf_score", 0), reverse=True
+    )[:top_k]
+    return result, denied, {
+        "rounds": len(tasks), "graph_hops": min(GRAPH_MAX_HOPS, 2),
+        "planner": plan.get("planner", "heuristic"),
+        "requested_types": plan.get("requested_types", ["text"]),
+        "tasks": task_trace,
+    }
 
 def has_evidence_overlap(query, passages):
     terms = {term for term in re.findall(r'[a-z0-9]+', query.lower()) if len(term) > 2 and term not in _QUERY_STOPWORDS}
