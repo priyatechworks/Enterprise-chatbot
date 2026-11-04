@@ -903,10 +903,11 @@ def _debug_item(row, rank=None, source=None):
         "table_json": node.get("table_json", ""),
         "docling_ref": node.get("docling_ref", ""),
         "graph_expanded": bool(node.get("graph_expanded", False)),
+        "retrieved_by": node.get("retrieved_by", []),
     }
 
 
-def search(query, role, top_k=5, history=None, max_hops=None, content_types=None, debug_trace=None):
+def search(query, role, top_k=3, history=None, max_hops=None, content_types=None, debug_trace=None):
     allowed_types = list(dict.fromkeys(
         kind for kind in (content_types or ["text", "table", "figure", "formula"])
         if kind in {"text", "table", "figure", "formula"}
@@ -1039,17 +1040,28 @@ def search(query, role, top_k=5, history=None, max_hops=None, content_types=None
         return final_items, denied
 
 
-def agentic_search(query, role, top_k=5, history=None, debug_trace=None):
-    """Plan bounded modality-specific searches and record why each item was retrieved."""
+def agentic_search(query, role, top_k=3, history=None, debug_trace=None):
+    """Run separate searches per modality, then select a balanced global top-k."""
+    top_k = min(max(1, int(top_k)), 3)
     planning_started = time.perf_counter()
     plan = plan_query(query)
     tasks = plan.get("tasks", [])[:4]
+    requested_types = list(dict.fromkeys(
+        kind for kind in plan.get("requested_types", [])
+        if kind in {"text", "table", "figure", "formula"}
+    ))
+    if not requested_types:
+        requested_types = list(dict.fromkeys(
+            kind for task in tasks for kind in task.get("content_types", [])
+            if kind in {"text", "table", "figure", "formula"}
+        ))
     if debug_trace:
         debug_trace.add(
             "query_plan", f"Agent query planner ({plan.get('planner', 'unknown')})",
             started=planning_started,
             details={"original_question": query, "task_count": len(tasks),
-                     "requested_types": plan.get("requested_types", [])},
+                     "requested_types": requested_types,
+                     "planner_reason": plan.get("planner_reason", "")},
             data={"plan": plan},
         )
     merged = {}
@@ -1058,52 +1070,96 @@ def agentic_search(query, role, top_k=5, history=None, debug_trace=None):
     for task_index, task in enumerate(tasks, start=1):
         subquery = task.get("query") or query
         kinds = task.get("content_types") or ["text"]
-        task_started = time.perf_counter()
-        if debug_trace:
-            debug_trace.add(
-                "retrieval_task_started", f"Agent task {task_index}/{len(tasks)}",
-                details={"subquery": subquery, "content_types": kinds},
-            )
-            hits, blocked = search(
-                subquery, role, top_k, history=history,
-                max_hops=min(GRAPH_MAX_HOPS, 2), content_types=kinds,
-                debug_trace=debug_trace,
-            )
-        else:
-            hits, blocked = search(
-                subquery, role, top_k, history=history,
-                max_hops=min(GRAPH_MAX_HOPS, 2), content_types=kinds,
-            )
-        denied = denied or blocked
-        task_trace.append({
-            "query": subquery, "content_types": kinds,
-            "hits": len(hits), "restricted_match": bool(blocked),
-        })
-        if debug_trace:
-            debug_trace.add(
-                "retrieval_task_completed", f"Agent task {task_index}/{len(tasks)}",
-                started=task_started,
-                details={"authorized_hits": len(hits), "restricted_match": bool(blocked)},
-                data={"items": [_debug_item(hit, i + 1, "task result") for i, hit in enumerate(hits)]},
-            )
-        for hit in hits:
-            key = hit["id"]
-            if key not in merged or hit.get("rrf_score", 0) > merged[key].get("rrf_score", 0):
-                merged[key] = hit
-    result = sorted(
-        merged.values(), key=lambda item: item.get("rrf_score", 0), reverse=True
+        # Enforce a single content type per retrieval pass, even for a stale/custom planner.
+        for kind in kinds:
+            if kind not in {"text", "table", "figure", "formula"}:
+                continue
+            task_started = time.perf_counter()
+            if debug_trace:
+                debug_trace.add(
+                    "retrieval_task_started", f"Modality retrieval {task_index}/{len(tasks)}",
+                    details={"subquery": subquery, "content_type": kind,
+                             "purpose": f"Search only {kind} knowledge items"},
+                )
+                hits, blocked = search(
+                    subquery, role, top_k, history=history,
+                    max_hops=min(GRAPH_MAX_HOPS, 2), content_types=[kind],
+                    debug_trace=debug_trace,
+                )
+            else:
+                hits, blocked = search(
+                    subquery, role, top_k, history=history,
+                    max_hops=min(GRAPH_MAX_HOPS, 2), content_types=[kind],
+                )
+            denied = denied or blocked
+            reason = {"query": subquery, "content_type": kind,
+                      "retrieval_method": "vector + BM25 + RRF + authorized graph expansion"}
+            task_trace.append({
+                "query": subquery, "content_types": [kind],
+                "hits": len(hits), "restricted_match": bool(blocked),
+            })
+            for original_hit in hits:
+                hit = dict(original_hit)
+                key = hit["id"]
+                existing = merged.get(key)
+                if existing:
+                    existing_reasons = list(existing.get("retrieved_by", [])) + [reason]
+                    if hit.get("rrf_score", 0) > existing.get("rrf_score", 0):
+                        hit["retrieved_by"] = existing_reasons
+                        merged[key] = hit
+                    else:
+                        existing["retrieved_by"] = existing_reasons
+                else:
+                    hit["retrieved_by"] = list(hit.get("retrieved_by", [])) + [reason]
+                    merged[key] = hit
+            if debug_trace:
+                debug_trace.add(
+                    "retrieval_task_completed", f"Modality retrieval {task_index}/{len(tasks)} · {kind}",
+                    started=task_started,
+                    details={"authorized_hits": len(hits), "restricted_match": bool(blocked),
+                             "content_type": kind},
+                    data={"items": [_debug_item(hit, i + 1, f"{kind} modality result")
+                                    for i, hit in enumerate(hits)]},
+                )
+
+    ranked = sorted(merged.values(), key=lambda item: item.get("rrf_score", 0), reverse=True)
+    # Reserve one slot for the best result of each requested type where available,
+    # then fill remaining slots from the overall ranking. The final context is <= top_k.
+    best_by_type = {}
+    for item in ranked:
+        kind = item.get("content_type", item.get("kind", "text"))
+        if kind in requested_types and kind not in best_by_type:
+            best_by_type[kind] = item
+    coverage = sorted(
+        best_by_type.values(), key=lambda item: item.get("rrf_score", 0), reverse=True
     )[:top_k]
+    selected_ids = {item["id"] for item in coverage}
+    selected = list(coverage)
+    for item in ranked:
+        if len(selected) >= top_k:
+            break
+        if item["id"] not in selected_ids:
+            selected.append(item)
+            selected_ids.add(item["id"])
+    result = sorted(selected, key=lambda item: item.get("rrf_score", 0), reverse=True)
+    selected_types = sorted({item.get("content_type", item.get("kind", "text")) for item in result})
+    missing_types = [kind for kind in requested_types if kind not in selected_types]
     if debug_trace:
         debug_trace.add(
-            "agent_merge_final", "Agent merge and de-duplication",
+            "agent_merge_final", "Modality-balanced merge and top-three selection",
             details={"unique_items_before_top_k": len(merged), "returned": len(result),
-                     "top_k": top_k, "restricted_match": denied},
-            data={"items": [_debug_item(item, i + 1, "agent final result") for i, item in enumerate(result)]},
+                     "top_k": top_k, "requested_types": requested_types,
+                     "selected_types": selected_types, "types_without_evidence": missing_types,
+                     "restricted_match": denied},
+            data={"items": [_debug_item(item, i + 1, "final selected evidence") for i, item in enumerate(result)]},
         )
     return result, denied, {
-        "rounds": len(tasks), "graph_hops": min(GRAPH_MAX_HOPS, 2),
+        "rounds": len(task_trace), "graph_hops": min(GRAPH_MAX_HOPS, 2),
         "planner": plan.get("planner", "heuristic"),
-        "requested_types": plan.get("requested_types", ["text"]),
+        "planner_reason": plan.get("planner_reason", ""),
+        "requested_types": requested_types,
+        "selected_types": selected_types,
+        "missing_types": missing_types,
         "tasks": task_trace,
     }
 
