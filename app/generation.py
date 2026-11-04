@@ -1,11 +1,15 @@
 """Answer generation with source-aware multimodal evidence serialization."""
 import json
+import time
 import requests
 from app.config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 
 
-def answer(question, passages, history=None):
+def answer(question, passages, history=None, debug_trace=None):
     if not passages:
+        if debug_trace:
+            debug_trace.add("answer_context", "Answer generation", status="skipped",
+                            details={"reason": "No passages passed the evidence gate"})
         return "I couldn't find supporting information in the indexed documents.", "no evidence"
 
     evidence_blocks = []
@@ -24,8 +28,20 @@ def answer(question, passages, history=None):
             block += f"\nLaTeX representation: {passage['latex']}"
         evidence_blocks.append(block)
     context = "\n\n".join(evidence_blocks)
+    if debug_trace:
+        debug_trace.add(
+            "answer_context", "app.generation.answer: evidence serialization",
+            details={"passage_count": len(passages), "context_characters": len(context),
+                     "llm_configured": bool(LLM_API_KEY and LLM_BASE_URL and LLM_MODEL),
+                     "model": LLM_MODEL or None, "endpoint": LLM_BASE_URL or None},
+            data={"question": question, "evidence_blocks": evidence_blocks,
+                  "context_sent_to_model": context},
+        )
 
     if not (LLM_API_KEY and LLM_BASE_URL and LLM_MODEL):
+        if debug_trace:
+            debug_trace.add("llm_request", "OpenAI-compatible answer service", status="skipped",
+                            details={"reason": "LLM_BASE_URL, LLM_API_KEY or LLM_MODEL is missing"})
         return f"No LLM configured. Retrieved excerpt: ‘{passages[0]['text']}’", "retrieval-only"
 
     # Prior assistant responses may cite revoked evidence. Use only recent user
@@ -51,14 +67,30 @@ def answer(question, passages, history=None):
             "<authorized_evidence>\n" + context + "\n</authorized_evidence>"
         )},
     ]}
+    llm_started = time.perf_counter()
     try:
         response = requests.post(
             f"{LLM_BASE_URL}/chat/completions", json=payload,
             headers={"Authorization": f"Bearer {LLM_API_KEY}"}, timeout=45,
         )
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"], "llm"
-    except Exception:
+        answer_text = response.json()["choices"][0]["message"]["content"]
+        if debug_trace:
+            debug_trace.add(
+                "llm_request", "OpenAI-compatible answer service",
+                started=llm_started, details={"status_code": response.status_code, "model": LLM_MODEL,
+                                               "response_characters": len(answer_text)},
+                data={"answer": answer_text},
+            )
+        return answer_text, "llm"
+    except Exception as exc:
+        if debug_trace:
+            debug_trace.add(
+                "llm_request", "OpenAI-compatible answer service", status="failed",
+                started=llm_started,
+                details={"exception_type": type(exc).__name__, "exception_message": str(exc),
+                         "model": LLM_MODEL, "endpoint": LLM_BASE_URL},
+            )
         first = passages[0]
         excerpt = f"[{first['document']}, page {first['page']}] {first['text']}"
         return f"The answer service is unavailable, so here is the retrieved evidence: {excerpt}", "retrieval-fallback"
