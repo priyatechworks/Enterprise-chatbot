@@ -13,6 +13,8 @@ from app.auth import authenticate
 from app.config import DEMO_PASSWORD, DOCS_DIR, EVALUATION_PATH
 from app.guardrails import detect_pii, is_prompt_injection
 from app.rag import agentic_search, reciprocal_rank_fusion, search
+from app.agent import heuristic_plan
+import app.metadata as metadata
 import app.rag as rag
 import app.generation as generation
 
@@ -357,11 +359,58 @@ def test_weak_single_word_overlap_does_not_block_abstention(monkeypatch):
 def test_agentic_retrieval_loop_remains_bounded(monkeypatch):
     calls = []
 
-    def fake_search(query, role, top_k, history=None, max_hops=None):
-        calls.append(query)
+    def fake_search(query, role, top_k, history=None, max_hops=None, content_types=None):
+        calls.append((query, content_types))
         return [], False
 
     monkeypatch.setattr(rag, 'search', fake_search)
     results, denied, trace = agentic_search('Compare annual leave and finance budget', 'Admin')
     assert not results and not denied
-    assert len(calls) <= 3 and trace['rounds'] <= 3 and trace['graph_hops'] <= 2
+    assert len(calls) <= 4 and trace['rounds'] <= 4 and trace['graph_hops'] <= 2
+
+
+def test_content_router_identifies_text_table_figure_and_formula_requests():
+    plan = heuristic_plan(
+        "Explain attention, show the Transformer architecture figure, compare experimental results table, and derive the attention formula"
+    )
+    assert set(plan["requested_types"]) == {"text", "table", "figure", "formula"}
+    assert all(task["query"] for task in plan["tasks"])
+
+
+def test_metadata_manifest_persists_separate_typed_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(metadata, "EXTRACTED_DIR", tmp_path / "extracted")
+    monkeypatch.setattr(metadata, "TEXT_DIR", tmp_path / "extracted" / "text")
+    monkeypatch.setattr(metadata, "TABLE_DIR", tmp_path / "extracted" / "tables")
+    monkeypatch.setattr(metadata, "FORMULA_DIR", tmp_path / "extracted" / "formulas")
+    monkeypatch.setattr(metadata, "METADATA_DIR", tmp_path / "extracted" / "metadata")
+    records = [
+        {"kind": "text", "page": 1, "text": "Attention maps queries to keys and values.", "headings": ["3.1 Attention"]},
+        {"kind": "table", "page": 5, "text": "| Model | BLEU |", "structured_data": {"headers": ["Model", "BLEU"], "rows": [["Base", "27.3"]]}},
+        {"kind": "formula", "page": 3, "text": "softmax(QK^T / sqrt(d_k))", "latex": r"\\operatorname{softmax}(QK^T/\\sqrt{d_k})"},
+        {"kind": "figure", "page": 3, "text": "Encoder and decoder architecture.", "caption": "Figure 1", "asset_path": str(tmp_path / "figure.png")},
+    ]
+    saved, summary = metadata.persist_extracted_records(
+        "document-1", "Attention_Is_All_You_Need.pdf", 8, "Public",
+        ["Admin", "Employee"], records,
+    )
+    assert summary["counts"] == {"text": 1, "table": 1, "formula": 1, "figure": 1}
+    assert (tmp_path / "extracted" / "tables" / "document-1_table_0001.json").exists()
+    assert (tmp_path / "extracted" / "text" / "document-1_chunks.jsonl").exists()
+    assert (tmp_path / "extracted" / "formulas" / "document-1_formulas.jsonl").exists()
+    manifest = (tmp_path / "extracted" / "metadata" / "document-1_items.jsonl").read_text(encoding="utf-8")
+    assert all(f'"content_type": "{kind}"' in manifest for kind in ("text", "table", "formula", "figure"))
+    assert saved[3]["file_path"] == str(tmp_path / "figure.png")
+
+
+def test_graph_rows_use_text_and_aligned_vision_vectors(monkeypatch):
+    records = [
+        {"kind": "text", "page": 1, "text": "A text passage", "section": "Intro"},
+        {"kind": "formula", "page": 2, "text": "QK transpose", "section": "Attention"},
+        {"kind": "figure", "page": 2, "text": "Encoder diagram", "asset_path": "figure.png", "section": "Attention"},
+    ]
+    monkeypatch.setattr(rag, "text_embeddings", lambda texts, query=False: [[0.0] * 768 for _ in texts])
+    monkeypatch.setattr(rag, "image_embedding", lambda path: [1.0] * 768)
+    rows = rag._prepare_graph_rows("paper.pdf", "doc-1", "Public", ["Admin", "Employee"], records)
+    assert [row["kind"] for row in rows] == ["text", "formula", "figure"]
+    assert len(rows[-1]["embedding"]) == 768
+    assert rows[-1]["asset_path"] == "figure.png"
