@@ -5,6 +5,7 @@ import time
 import uuid
 
 import pytest
+from pydantic import ValidationError
 from fastapi import HTTPException
 from starlette.datastructures import UploadFile
 
@@ -13,7 +14,7 @@ from app.auth import authenticate
 from app.config import DEMO_PASSWORD, DOCS_DIR, EVALUATION_PATH
 from app.guardrails import detect_pii, is_prompt_injection
 from app.rag import agentic_search, reciprocal_rank_fusion, search
-from app.agent import heuristic_plan
+from app.agent import heuristic_plan, _normalise_plan
 import app.metadata as metadata
 import app.rag as rag
 import app.generation as generation
@@ -417,6 +418,103 @@ def test_graph_rows_use_text_and_aligned_vision_vectors(monkeypatch):
     assert rows[-1]["asset_path"] == "figure.png"
 
 
+
+
+def test_api_request_defaults_to_three_chunks_and_rejects_more():
+    assert api.AskRequest(question="Explain attention").top_k == 3
+    with pytest.raises(ValidationError):
+        api.AskRequest(question="Explain attention", top_k=4)
+
+
+def test_multimodal_plan_is_split_into_independent_type_tasks():
+    plan = _normalise_plan(
+        {"tasks": [{"query": "Explain self attention", "content_types": ["text", "figure", "formula"]}]},
+        "Explain self attention",
+    )
+    assert plan["requested_types"] == ["text", "figure", "formula"]
+    assert [task["content_types"] for task in plan["tasks"]] == [
+        ["text"], ["figure"], ["formula"]
+    ]
+
+
+def test_agentic_search_returns_balanced_global_top_three(monkeypatch):
+    calls = []
+    plan = {
+        "planner": "llm",
+        "requested_types": ["text", "figure", "formula"],
+        "tasks": [
+            {"query": "explain in text", "content_types": ["text"]},
+            {"query": "show the diagram", "content_types": ["figure"]},
+            {"query": "explain the equation", "content_types": ["formula"]},
+        ],
+    }
+
+    def fake_search(query, role, top_k, history=None, max_hops=None, content_types=None):
+        kind = content_types[0]
+        calls.append(kind)
+        return ([{
+            "id": kind, "kind": kind, "content_type": kind, "document": "paper.pdf",
+            "page": 2, "text": f"{kind} evidence", "score": .9, "rrf_score": .04,
+            "asset_path": "", "file_path": "",
+        }], False)
+
+    monkeypatch.setattr(rag, "plan_query", lambda query: plan)
+    monkeypatch.setattr(rag, "search", fake_search)
+    results, denied, trace = agentic_search("Explain text, figure and formula", "Admin", top_k=5)
+    assert calls == ["text", "figure", "formula"]
+    assert not denied and len(results) == 3
+    assert {item["content_type"] for item in results} == {"text", "figure", "formula"}
+    assert trace["selected_types"] == ["figure", "formula", "text"]
+
+
+def test_generator_attaches_retrieved_figure_as_openai_image(monkeypatch, tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "diagram.png"
+    Image.new("RGB", (24, 24), (20, 80, 120)).save(image_path)
+    observed = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "The diagram shows the encoder and decoder."}}]}
+
+    def fake_post(url, **kwargs):
+        observed["url"] = url
+        observed["payload"] = kwargs["json"]
+        return FakeResponse()
+
+    monkeypatch.setattr(generation, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(generation, "LLM_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setattr(generation, "LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setattr(generation.requests, "post", fake_post)
+    trace = RequestTrace(enabled=True)
+    text, mode = generation.answer(
+        "Explain the text, diagram and attention formula.",
+        [
+            {"kind": "text", "content_type": "text", "document": "paper.pdf", "page": 1,
+             "text": "Attention maps queries to keys and values."},
+            {"kind": "formula", "content_type": "formula", "document": "paper.pdf", "page": 3,
+             "text": "scaled dot product attention", "latex": r"softmax(QK^T / sqrt(d_k))"},
+            {"kind": "figure", "content_type": "figure", "document": "paper.pdf", "page": 2,
+             "text": "Encoder and decoder architecture", "caption": "Transformer architecture",
+             "asset_path": str(image_path)},
+        ],
+        debug_trace=trace,
+    )
+    assert mode == "llm" and "encoder and decoder" in text.lower()
+    user_content = observed["payload"]["messages"][1]["content"]
+    assert isinstance(user_content, list)
+    assert "softmax(QK^T / sqrt(d_k))" in user_content[0]["text"]
+    image_parts = [part for part in user_content if part.get("type") == "image_url"]
+    assert len(image_parts) == 1
+    assert image_parts[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    context_event = next(event for event in trace.events if event["stage"] == "answer_context")
+    assert context_event["data"]["visual_inputs"][0]["attached_to_openai_request"] is True
 
 def test_request_trace_records_stage_timing_and_payload(capsys):
     trace = RequestTrace(enabled=True)
