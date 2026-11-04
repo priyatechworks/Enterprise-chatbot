@@ -12,7 +12,7 @@ import numpy as np
 from neo4j import GraphDatabase
 
 from app.config import (
-    ASSET_DIR, CHUNK_MAX_TOKENS, CROSS_ENCODER_ENABLED, CROSS_ENCODER_MODEL, EMBEDDING_BATCH_SIZE,
+    ASSET_DIR, EXTRACTED_DIR, CHUNK_MAX_TOKENS, CROSS_ENCODER_ENABLED, CROSS_ENCODER_MODEL, EMBEDDING_BATCH_SIZE,
     DOCLING_ENABLE_FORMULA_ENRICHMENT, DOCLING_ENABLE_OCR,
     DOCLING_EXTRACT_PICTURES, DOCLING_GENERATE_PAGE_IMAGES, DOCLING_GRAPH_TEMPLATE,
     DOC_GRAPH_PROVIDER, EMBEDDING_DIMENSION, GRAPH_MAX_HOPS, LLM_API_KEY,
@@ -21,6 +21,9 @@ from app.config import (
     RETRIEVAL_THRESHOLD, TEXT_MODEL, VISION_MODEL,
 )
 from app.storage import get_document, record_failure, upsert_document
+from app.metadata import persist_extracted_records
+from app.vision import describe_image
+from app.agent import plan_query
 
 _driver = None
 _neo4j_supports_search = False
@@ -227,62 +230,191 @@ def _policy_roles(classification):
     raise ValueError("Classification must be 'Public' or 'Admin-only'")
 
 
-def _extract_docling(path, document_name):
+def _plain_payload(value):
+    """Convert Docling/Pydantic objects into JSON-safe metadata."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _plain_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_payload(item) for item in value]
+    for method in ("model_dump", "dict", "to_dict"):
+        if hasattr(value, method):
+            try:
+                return _plain_payload(getattr(value, method)())
+            except Exception:
+                pass
+    return str(value)
+
+
+def _item_provenance(item):
+    provenance = []
+    for prov in (getattr(item, "prov", None) or []):
+        bbox = getattr(prov, "bbox", None)
+        provenance.append({
+            "page_no": getattr(prov, "page_no", None),
+            "bbox": _plain_payload(bbox),
+        })
+    return provenance
+
+
+def _item_caption(item, document):
+    try:
+        caption = item.caption_text(document)
+        return str(caption).strip() if caption else ""
+    except Exception:
+        return ""
+
+
+def _item_ref(item):
+    try:
+        ref = item.get_ref()
+        return str(getattr(ref, "cref", ref))
+    except Exception:
+        return ""
+
+
+def _extract_docling(path, document_name, document_id=None):
     result = _docling_converter_for_settings().convert(path)
     document = result.document
     records = []
-    for chunk in _chunker().chunk(document):
-        chunk_items = list(getattr(getattr(chunk, 'meta', None), 'doc_items', []) or [])
-        labels = {str(getattr(getattr(item, 'label', ''), 'value', getattr(item, 'label', ''))).lower() for item in chunk_items}
-        if 'picture' in labels:
-            continue
-        kind = 'table' if 'table' in labels else 'text'
+    chunker = _chunker()
+
+    # Text and tables are chunked using Docling's layout-aware HybridChunker.
+    for chunk in chunker.chunk(document):
+        chunk_items = list(getattr(getattr(chunk, "meta", None), "doc_items", []) or [])
+        labels = {
+            str(getattr(getattr(item, "label", ""), "value", getattr(item, "label", ""))).lower()
+            for item in chunk_items
+        }
         page_numbers = [
             int(prov.page_no)
             for item in chunk_items
-            for prov in (getattr(item, 'prov', []) or [])
-            if getattr(prov, 'page_no', None) is not None
+            for prov in (getattr(item, "prov", []) or [])
+            if getattr(prov, "page_no", None) is not None
         ]
         page = page_numbers[0] if page_numbers else 1
-        text = _chunker().contextualize(chunk).strip()
-        if text:
-            headings = list(getattr(getattr(chunk, 'meta', None), 'headings', []) or [])
-            records.append({'kind': kind, 'page': page, 'text': text, 'headings': headings})
+        text = chunker.contextualize(chunk).strip()
+        if not text:
+            continue
+        headings = list(getattr(getattr(chunk, "meta", None), "headings", []) or [])
+        table_items = [
+            item for item in chunk_items
+            if str(getattr(getattr(item, "label", ""), "value", getattr(item, "label", ""))).lower() == "table"
+        ]
+        table_payload = None
+        caption = ""
+        provenance = []
+        docling_ref = ""
+        if table_items:
+            table_item = table_items[0]
+            table_payload = _plain_payload(getattr(table_item, "data", None))
+            caption = _item_caption(table_item, document)
+            provenance = _item_provenance(table_item)
+            docling_ref = _item_ref(table_item)
+        records.append({
+            "kind": "table" if "table" in labels else "text",
+            "page": page,
+            "text": text,
+            "headings": headings,
+            "caption": caption,
+            "structured_data": table_payload,
+            "provenance": provenance,
+            "docling_ref": docling_ref,
+            "bbox": provenance[0].get("bbox") if provenance else None,
+        })
 
-    images = []
+    # Formula understanding produces TextItems labelled FORMULA. Keep them as
+    # independent retrievable records in addition to their surrounding text.
+    try:
+        from docling_core.types.doc import TextItem
+    except Exception:
+        TextItem = ()
+    for item, _level in document.iterate_items():
+        label = str(getattr(getattr(item, "label", ""), "value", getattr(item, "label", ""))).lower()
+        if label != "formula":
+            continue
+        formula_text = str(getattr(item, "text", "") or getattr(item, "orig", "") or "").strip()
+        if not formula_text:
+            continue
+        provenance = _item_provenance(item)
+        page = int(provenance[0].get("page_no") or 1) if provenance else 1
+        records.append({
+            "kind": "formula",
+            "page": page,
+            "text": formula_text,
+            "latex": formula_text,
+            "caption": "",
+            "headings": [],
+            "provenance": provenance,
+            "bbox": provenance[0].get("bbox") if provenance else None,
+            "docling_ref": _item_ref(item),
+        })
+
+    # Figures are stored as individual crops. Nomic Vision vectors are aligned
+    # with Nomic Text v1.5, so a natural-language query can find these vectors.
+    if DOCLING_EXTRACT_PICTURES:
+        for picture in getattr(document, "pictures", []) or []:
+            image = picture.get_image(doc=document)
+            if image is None:
+                continue
+            page_prov = _item_provenance(picture)
+            page = int(page_prov[0].get("page_no") or 1) if page_prov else 1
+            caption = _item_caption(picture, document)
+            target = ASSET_DIR / f"{uuid.uuid4().hex}.png"
+            image.save(target)
+            description, description_warning = describe_image(
+                target, caption=caption, document_name=document_name, page=page
+            )
+            records.append({
+                "kind": "figure",
+                "page": page,
+                "text": description,
+                "caption": caption,
+                "asset_path": str(target.resolve()),
+                "headings": [],
+                "provenance": page_prov,
+                "bbox": page_prov[0].get("bbox") if page_prov else None,
+                "docling_ref": _item_ref(picture),
+                "description_warning": description_warning,
+            })
+
     if DOCLING_GENERATE_PAGE_IMAGES:
         for page_number, page_item in document.pages.items():
-            image_ref = getattr(page_item, 'image', None)
-            page_image = getattr(image_ref, 'pil_image', None) if image_ref else None
+            image_ref = getattr(page_item, "image", None)
+            page_image = getattr(image_ref, "pil_image", None) if image_ref else None
             if page_image is None:
                 continue
             target = ASSET_DIR / f"{uuid.uuid4().hex}.png"
             page_image.save(target)
-            images.append({
-                'kind': 'image', 'page': int(page_number),
-                'text': f"Full-page image from {document_name}, page {page_number}",
-                'asset_path': str(target), 'headings': [],
+            description, description_warning = describe_image(
+                target, caption=f"Full page image from {document_name}", document_name=document_name, page=int(page_number)
+            )
+            records.append({
+                "kind": "figure", "page": int(page_number), "text": description,
+                "caption": f"Full page image from {document_name}, page {page_number}",
+                "asset_path": str(target.resolve()), "headings": [],
+                "provenance": [{"page_no": int(page_number), "bbox": None}],
+                "bbox": None, "docling_ref": "", "description_warning": description_warning,
             })
-    if DOCLING_EXTRACT_PICTURES:
-        for item, _level in document.iterate_items():
-            label = str(getattr(getattr(item, 'label', ''), 'value', getattr(item, 'label', ''))).lower()
-            if label != 'picture':
-                continue
-            picture = item.get_image(doc=document)
-            if not picture:
-                continue
-            page = int(item.prov[0].page_no) if getattr(item, 'prov', None) else 1
-            target = ASSET_DIR / f"{uuid.uuid4().hex}.png"
-            picture.save(target)
-            images.append({
-                'kind': 'image', 'page': page,
-                'text': f"Image/figure from {document_name}, page {page}",
-                'asset_path': str(target), 'headings': [],
-            })
-    if not records and not images:
-        raise ValueError('Docling found no text, tables or enabled picture content')
-    return len(document.pages), records + images
 
+    # Retain Docling's full structured document export for debugging and audit.
+    master_path = None
+    if document_id and hasattr(document, "export_to_dict"):
+        try:
+            master_dir = EXTRACTED_DIR / "docling"
+            master_dir.mkdir(parents=True, exist_ok=True)
+            master_path = master_dir / f"{document_id}.json"
+            master_path.write_text(
+                json.dumps(_plain_payload(document.export_to_dict()), ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            master_path = None
+
+    if not records:
+        raise ValueError("Docling found no searchable text, tables, formulas or figures")
+    return len(document.pages), records
 
 def _fallback_text_records(path):
     """Fallback emits page-scoped chunks bounded by the same model tokenizer."""
