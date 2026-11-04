@@ -440,3 +440,25 @@ def test_request_trace_hides_payload_when_disabled(capsys):
     trace.add("vector_search", "Neo4j vector index", data={"secret_text": "not emitted"})
     assert "data" not in trace.events[0]
     assert capsys.readouterr().out == ""
+
+
+
+def test_graph_expansion_respects_requested_content_type(monkeypatch):
+    formula = node("formula-1", "optimizer learning rate schedule", ["Admin", "Employee"])
+    formula["kind"] = "formula"
+    formula["content_type"] = "formula"
+    session = FakeNeo4jSession([formula])
+
+    class CapturingDriver:
+        def session(self, **kwargs):
+            return session
+
+    monkeypatch.setattr(rag, "driver", lambda: CapturingDriver())
+    monkeypatch.setattr(rag, "text_embeddings", lambda texts, query=False: [[0.0] * 768])
+    hits, denied = rag.search(
+        "optimizer formula", "Admin", top_k=5, max_hops=1, content_types=["formula"]
+    )
+    assert hits and not denied
+    graph_queries = [query for query in session.queries if "neighbor:KnowledgeItem" in query]
+    assert graph_queries
+    assert all("neighbor.kind IN $kinds" in query for query in graph_queries)
