@@ -778,7 +778,7 @@ def search(query, role, top_k=5, history=None, max_hops=None, content_types=None
         if seeds and hops:
             expanded += list(session.run(
                 "MATCH (seed:KnowledgeItem) WHERE seed.id IN $ids AND $role IN seed.allowed_roles "
-                "MATCH p=(seed)-[:NEXT*1..2]-(neighbor:KnowledgeItem) "
+                "MATCH p=(seed)-[:NEXT|RELATED_ON_PAGE*1..2]-(neighbor:KnowledgeItem) "
                 "WHERE length(p)<=$hops AND $role IN neighbor.allowed_roles "
                 "RETURN DISTINCT neighbor ORDER BY neighbor.document,neighbor.page LIMIT 12",
                 ids=seeds, role=role, hops=hops,
