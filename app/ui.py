@@ -94,7 +94,9 @@ def show_sources(sources,headers):
 def show_debug_trace(events):
  if not events:return
  final_event=next((event for event in reversed(events) if event.get('stage')=='agent_merge_final'),{})
- final_items=(final_event.get('data') or {}).get('items',[])
+ candidate_items=(final_event.get('data') or {}).get('items',[])
+ selected_event=next((event for event in events if event.get('stage')=='evidence_by_modality'),{})
+ final_items=(selected_event.get('data') or {}).get('items',candidate_items)
  plan_event=next((event for event in events if event.get('stage')=='query_plan'),{})
  plan=(plan_event.get('data') or {}).get('plan',{})
  context_event=next((event for event in events if event.get('stage')=='answer_context'),{})
@@ -104,7 +106,7 @@ def show_debug_trace(events):
  with st.expander('Developer console · inspect the complete RAG pipeline',expanded=True):
   st.caption('Testing mode. This panel shows what each component received, returned and passed to the next component. Disable RAG_DEBUG_TRACE before a normal demo or production use.')
   c1,c2,c3,c4=st.columns(4)
-  c1.metric('Final chunks',len(final_items),'maximum 3')
+  c1.metric('Evidence sent to answer model',len(final_items),'maximum 3')
   c2.metric('Requested types',len(details.get('requested_types',[])))
   c3.metric('Diagram images sent',sum(1 for item in context_data.get('visual_inputs',[]) if item.get('attached_to_openai_request')))
   c4.metric('LLM model',llm_event.get('details',{}).get('model','not called'))
@@ -117,7 +119,11 @@ def show_debug_trace(events):
    st.markdown('**2. Separate retrieval passes → fusion → top three**')
    if details:
     st.write({'requested_types':details.get('requested_types',[]),'selected_types':details.get('selected_types',[]),'types_without_evidence':details.get('types_without_evidence',[]),'unique_candidates':details.get('unique_items_before_top_k'),'final_chunks':details.get('returned')})
-   st.markdown('**3. Component timeline and duration**')
+   gate_event=next((event for event in events if event.get('stage')=='evidence_gate'),{})
+   if gate_event:
+    st.markdown('**3. Evidence quality gate**')
+    st.json(gate_event.get('details',{}),expanded=True)
+   st.markdown('**4. Component timeline and duration**')
    for index,event in enumerate(events,1):
     stage=event.get('stage','stage')
     duration=f" · {event['duration_ms']} ms" if event.get('duration_ms') is not None else ''
