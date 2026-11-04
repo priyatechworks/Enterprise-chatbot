@@ -17,6 +17,7 @@ from app.agent import heuristic_plan
 import app.metadata as metadata
 import app.rag as rag
 import app.generation as generation
+from app.trace import RequestTrace
 
 
 @pytest.fixture(autouse=True)
@@ -414,3 +415,28 @@ def test_graph_rows_use_text_and_aligned_vision_vectors(monkeypatch):
     assert [row["kind"] for row in rows] == ["text", "formula", "figure"]
     assert len(rows[-1]["embedding"]) == 768
     assert rows[-1]["asset_path"] == "figure.png"
+
+
+
+def test_request_trace_records_stage_timing_and_payload(capsys):
+    trace = RequestTrace(enabled=True)
+    started = time.perf_counter()
+    trace.add(
+        "vector_search", "Neo4j vector index",
+        started=started,
+        details={"content_types": ["formula"], "role_filter_applied": True},
+        data={"items": [{"page": 7, "text": "optimizer equation"}]},
+    )
+    assert len(trace.events) == 1
+    event = trace.events[0]
+    assert event["stage"] == "vector_search"
+    assert event["duration_ms"] >= 0
+    assert event["data"]["items"][0]["page"] == 7
+    assert "[RAG_DEBUG_TRACE]" in capsys.readouterr().out
+
+
+def test_request_trace_hides_payload_when_disabled(capsys):
+    trace = RequestTrace(enabled=False)
+    trace.add("vector_search", "Neo4j vector index", data={"secret_text": "not emitted"})
+    assert "data" not in trace.events[0]
+    assert capsys.readouterr().out == ""
