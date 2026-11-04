@@ -445,19 +445,38 @@ def _fallback_text_records(path):
 
 
 def _prepare_graph_rows(name, document_id, classification, roles, records):
-    text_records = [record for record in records if record['kind'] != 'image']
-    vectors = iter(text_embeddings([record['text'] for record in text_records]))
+    visual_kinds = {"image", "figure"}
+    text_records = [record for record in records if record["kind"] not in visual_kinds]
+    vectors = iter(text_embeddings([record["text"] for record in text_records]))
     rows = []
     for ordinal, record in enumerate(records):
-        vector = image_embedding(record['asset_path']) if record['kind'] == 'image' else next(vectors)
-        chunk_id = f'{document_id}:{ordinal}'
+        kind = "figure" if record["kind"] in visual_kinds else record["kind"]
+        vector = image_embedding(record["asset_path"]) if kind == "figure" else next(vectors)
+        chunk_id = str(record.get("item_id") or f"{document_id}:{ordinal}")
+        section = str(record.get("section") or "Unsectioned")
+        section_key = str(record.get("section_key") or hashlib.sha256(
+            f"{document_id}:{section.casefold()}".encode()
+        ).hexdigest()[:24])
+        provenance = json.dumps(record.get("provenance", []), ensure_ascii=False, default=str)
+        bbox = json.dumps(record.get("bbox"), ensure_ascii=False, default=str) if record.get("bbox") is not None else ""
         rows.append({
-            'id': chunk_id, 'chunk_id': chunk_id, 'document': name,
-            'document_id': document_id, 'classification': classification,
-            'allowed_roles': roles, 'page': int(record['page']), 'kind': record['kind'],
-            'text': record['text'], 'headings': record.get('headings', []),
-            'asset_path': record.get('asset_path', ''), 'ordinal': ordinal,
-            'embedding': vector.tolist(),
+            "id": chunk_id, "chunk_id": chunk_id, "item_id": chunk_id,
+            "document": name, "document_id": document_id,
+            "classification": classification, "allowed_roles": roles,
+            "page": int(record["page"]), "kind": kind, "content_type": kind,
+            "text": str(record.get("text", "")), "headings": record.get("headings", []),
+            "asset_path": record.get("asset_path", ""),
+            "file_path": record.get("file_path", record.get("asset_path", "")),
+            "caption": str(record.get("caption") or ""),
+            "section": section, "section_key": section_key,
+            "section_id": f"{document_id}:{section_key}",
+            "docling_ref": str(record.get("docling_ref") or ""),
+            "provenance_json": provenance, "bbox_json": bbox,
+            "table_json": json.dumps(record.get("structured_data"), ensure_ascii=False, default=str)
+                if record.get("structured_data") is not None else "",
+            "latex": str(record.get("latex") or ""),
+            "description_warning": str(record.get("description_warning") or ""),
+            "ordinal": ordinal, "embedding": vector.tolist(),
         })
     return rows
 
@@ -468,10 +487,10 @@ def _replace_graph_document(name, document_id, classification, roles, page_count
 
     def replace(tx):
         old_assets.extend([
-            record['asset_path'] for record in tx.run(
+            record["asset_path"] for record in tx.run(
                 "MATCH (k:KnowledgeItem) WHERE k.document_id=$document_id OR k.document=$name "
                 "RETURN k.asset_path AS asset_path", document_id=document_id, name=name,
-            ) if record['asset_path']
+            ) if record["asset_path"]
         ])
         tx.run(
             "MATCH (d:Document) WHERE d.document_id=$document_id OR d.name=$name DETACH DELETE d",
@@ -482,11 +501,15 @@ def _replace_graph_document(name, document_id, classification, roles, page_count
             document_id=document_id, name=name,
         )
         tx.run(
+            "MATCH (s:Section) WHERE s.document_id=$document_id DETACH DELETE s",
+            document_id=document_id,
+        )
+        tx.run(
             "MATCH (e:KGEntity) WHERE e.document_id=$document_id OR e.document=$name DETACH DELETE e",
             document_id=document_id, name=name,
         )
         tx.run(
-            "CREATE (d:Document {document_id:$document_id,name:$name,classification:$classification," 
+            "CREATE (d:Document {document_id:$document_id,name:$name,classification:$classification,"
             "allowed_roles:$roles,page_count:$page_count,updated_at:datetime()})",
             document_id=document_id, name=name, classification=classification,
             roles=roles, page_count=page_count,
@@ -494,16 +517,41 @@ def _replace_graph_document(name, document_id, classification, roles, page_count
         if rows:
             tx.run(
                 "MATCH (d:Document {document_id:$document_id}) UNWIND $rows AS row "
-                "CREATE (k:KnowledgeItem {id:row.id,chunk_id:row.chunk_id,document:row.document," 
-                "document_id:row.document_id,classification:row.classification,allowed_roles:row.allowed_roles," 
-                "page:row.page,kind:row.kind,text:row.text,headings:row.headings,asset_path:row.asset_path," 
-                "ordinal:row.ordinal,embedding:row.embedding}) CREATE (d)-[:HAS_ITEM]->(k)",
+                "MERGE (s:Section {id:row.section_id}) "
+                "SET s.document_id=$document_id,s.title=row.section,s.section_key=row.section_key "
+                "MERGE (d)-[:HAS_SECTION]->(s) "
+                "CREATE (k:KnowledgeItem {id:row.id,chunk_id:row.chunk_id,item_id:row.item_id,"
+                "document:row.document,document_id:row.document_id,classification:row.classification,"
+                "allowed_roles:row.allowed_roles,page:row.page,kind:row.kind,content_type:row.content_type,"
+                "text:row.text,headings:row.headings,asset_path:row.asset_path,file_path:row.file_path,"
+                "caption:row.caption,section:row.section,section_key:row.section_key,section_id:row.section_id,"
+                "docling_ref:row.docling_ref,provenance_json:row.provenance_json,bbox_json:row.bbox_json,"
+                "table_json:row.table_json,latex:row.latex,description_warning:row.description_warning,"
+                "ordinal:row.ordinal,embedding:row.embedding}) "
+                "CREATE (d)-[:HAS_ITEM]->(k) MERGE (s)-[:HAS_CONTENT]->(k)",
                 document_id=document_id, rows=rows,
             )
             tx.run(
                 "MATCH (d:Document {document_id:$document_id})-[:HAS_ITEM]->(a:KnowledgeItem), "
                 "(d)-[:HAS_ITEM]->(b:KnowledgeItem) WHERE b.ordinal=a.ordinal+1 "
                 "MERGE (a)-[:NEXT]->(b)", document_id=document_id,
+            )
+            # Explicit type edges make the section's multimodal contents discoverable.
+            for kind, relationship in (
+                ("text", "CONTAINS_TEXT"), ("table", "CONTAINS_TABLE"),
+                ("figure", "CONTAINS_FIGURE"), ("formula", "CONTAINS_FORMULA"),
+            ):
+                tx.run(
+                    "MATCH (s:Section)-[:HAS_CONTENT]->(k:KnowledgeItem) "
+                    "WHERE k.document_id=$document_id AND k.kind=$kind "
+                    f"MERGE (s)-[:{relationship}]->(k)",
+                    document_id=document_id, kind=kind,
+                )
+            # Co-location is a source-grounded relation, not an LLM-invented semantic edge.
+            tx.run(
+                "MATCH (a:KnowledgeItem {document_id:$document_id}),(b:KnowledgeItem {document_id:$document_id}) "
+                "WHERE a.page=b.page AND a.ordinal<b.ordinal AND a.kind<>b.kind "
+                "MERGE (a)-[:RELATED_ON_PAGE]->(b)", document_id=document_id,
             )
 
     with database.session(database=NEO4J_DATABASE) as session:
@@ -513,7 +561,6 @@ def _replace_graph_document(name, document_id, classification, roles, page_count
         if candidate.is_relative_to(ASSET_DIR.resolve()) and candidate.is_file():
             candidate.unlink(missing_ok=True)
     return len(rows)
-
 
 def _extract_semantic_graph(path):
     if not DOCLING_GRAPH_TEMPLATE:
