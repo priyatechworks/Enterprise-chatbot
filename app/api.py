@@ -5,7 +5,8 @@ from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, Field
 from app.config import (ASSET_DIR, DOCS_DIR, UPLOAD_DIR, TMP_DIR, MAX_UPLOAD_MB, NEO4J_DATABASE, RETRIEVAL_THRESHOLD, SESSION_TTL_SECONDS,
                         SESSION_MAX_TURNS, USER_MAX_SESSIONS, RATE_LIMIT_REQUESTS,
-                        RATE_LIMIT_WINDOW_SECONDS, TEXT_MODEL, LLM_MODEL)
+                        RATE_LIMIT_WINDOW_SECONDS, TEXT_MODEL, LLM_MODEL, RAG_DEBUG_TRACE)
+from app.trace import RequestTrace
 from app.storage import (init_db,list_documents,allow_request,create_session,
                          get_session,touch_session,deactivate_session,add_messages,get_history)
 from app.rag import driver as graph_driver, ingest_file,agentic_search,has_evidence_overlap,load_manifest,status
@@ -120,6 +121,13 @@ def ingest_upload(files:list[UploadFile]=File(...),classification:str=Form('Admi
 @app.post('/ask')
 def ask(req:AskRequest,user=Depends(current_user)):
     start=time.perf_counter();now=time.time();flow_trace=[]
+    debug_trace = RequestTrace(enabled=True) if RAG_DEBUG_TRACE else None
+    if debug_trace:
+        debug_trace.add(
+            "request_received", "FastAPI POST /ask",
+            details={"question": req.question, "role": user["role"], "top_k": req.top_k,
+                     "session_id": req.session_id},
+        )
     _flow_step(flow_trace,'Identity check','FastAPI bearer dependency + HMAC-signed demo token','passed',detail=f"Authenticated role: {user['role']}")
     rate_start=time.perf_counter();_limit(f"ask:{user['sub']}")
     _flow_step(flow_trace,'Rate limit','SQLite request window', 'passed',rate_start,detail=f"Limit: {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW_SECONDS}s")
@@ -143,35 +151,92 @@ def ask(req:AskRequest,user=Depends(current_user)):
     retrieval_query=' '.join(prior_questions+[req.question]) if prior_questions else req.question
     retrieval_start=time.perf_counter()
     try:
-        passages,restricted_match,agent_trace=agentic_search(retrieval_query,user['role'],req.top_k,history=history)
+        if debug_trace:
+            passages,restricted_match,agent_trace=agentic_search(
+                retrieval_query,user['role'],req.top_k,history=history,debug_trace=debug_trace
+            )
+        else:
+            passages,restricted_match,agent_trace=agentic_search(retrieval_query,user['role'],req.top_k,history=history)
     except Exception as exc:
+        if debug_trace:
+            debug_trace.add("retrieval_failed", "Agentic retrieval pipeline", status="failed",
+                            details={"exception_type": type(exc).__name__, "exception_message": str(exc)})
         _flow_step(flow_trace,'Embedding and graph retrieval',f"Sentence Transformers ({TEXT_MODEL}) + Neo4j AuraDB vector index / Cypher","failed",retrieval_start,detail=f"{type(exc).__name__}; inspect backend logs and database connection")
-        raise HTTPException(status_code=503,detail={'message':f"Retrieval service unavailable ({type(exc).__name__})",'flow_trace':flow_trace})
+        detail={'message':f"Retrieval service unavailable ({type(exc).__name__})",'flow_trace':flow_trace}
+        if debug_trace:
+            detail['debug_trace']=debug_trace.events
+        raise HTTPException(status_code=503,detail=detail)
     _flow_step(flow_trace,'Agent-planned hybrid retrieval, ACL and graph expansion',f"Query planner + Nomic ({TEXT_MODEL}) text/figure vectors + Neo4j vector and BM25 indexes + RRF + Cypher ACL + graph traversal","complete",retrieval_start,detail=f"{len(passages)} candidates; planner={agent_trace.get('planner','heuristic')}; requested types={','.join(agent_trace.get('requested_types', ['text']))}; {agent_trace.get('rounds',0)} modality searches; up to {agent_trace.get('graph_hops',0)} graph hops; role filter: {user['role']}")
+    if debug_trace:
+        debug_trace.add(
+            "agentic_retrieval_completed", "app.rag.agentic_search",
+            started=retrieval_start,
+            details={"candidate_count_before_evidence_gate": len(passages), "restricted_match": restricted_match,
+                     "planner": agent_trace.get("planner"), "requested_types": agent_trace.get("requested_types")},
+        )
     evidence_start=time.perf_counter()
     if restricted_match:
         text='Access denied: your role cannot access the document needed for this request.'; mode='access-denied';passages=[]
         evidence_status='blocked'
+        if debug_trace:
+            debug_trace.add("evidence_gate", "Authorization gate", status="blocked",
+                            details={"reason": "A restricted matching document was detected; content was withheld"})
         _flow_step(flow_trace,'Evidence and relevance gate','Python similarity threshold + evidence-overlap check',evidence_status,evidence_start,detail='Restricted match found; evidence withheld')
         _flow_step(flow_trace,'Answer generation','Skipped because role authorization denied the request','skipped')
     else:
-        passages=[p for p in passages if p['score']>=RETRIEVAL_THRESHOLD]
-        if not has_evidence_overlap(req.question,passages):passages=[]
+        retrieved_candidates = list(passages)
+        thresholded = [p for p in retrieved_candidates if p['score'] >= RETRIEVAL_THRESHOLD]
+        overlap_passed = has_evidence_overlap(req.question, thresholded)
+        if debug_trace:
+            debug_trace.add(
+                "evidence_gate", "Similarity threshold + evidence overlap",
+                started=evidence_start,
+                details={"before_filter": len(retrieved_candidates), "above_threshold": len(thresholded),
+                         "threshold": RETRIEVAL_THRESHOLD, "question_overlap_passed": overlap_passed,
+                         "final_evidence_count": len(thresholded) if overlap_passed else 0},
+                data={"items": [
+                    {"id": p.get("id"), "document": p.get("document"), "page": p.get("page"),
+                     "content_type": p.get("content_type", p.get("kind")), "score": p.get("score"),
+                     "threshold_passed": p.get("score", 0) >= RETRIEVAL_THRESHOLD,
+                     "text": p.get("text", ""), "latex": p.get("latex", ""),
+                     "asset_path": p.get("asset_path", ""), "file_path": p.get("file_path", "")}
+                    for p in retrieved_candidates
+                ]},
+            )
+        passages = thresholded if overlap_passed else []
         evidence_status='passed' if passages else 'abstained'
         _flow_step(flow_trace,'Evidence and relevance gate','Python similarity threshold + evidence-overlap check',evidence_status,evidence_start,detail=f"{len(passages)} passages passed; threshold={RETRIEVAL_THRESHOLD}")
         retrieved_injection=any(is_prompt_injection(p['text']) for p in passages)
         _flow_step(flow_trace,'Retrieved-context safety screen','app.guardrails.is_prompt_injection (Python regex checks)','blocked' if retrieved_injection else ('passed' if passages else 'skipped'),detail='Checked retrieved passages before generation' if passages else 'No passages to inspect')
         if retrieved_injection:
             text='Retrieved text was blocked by the prompt-injection safeguard.';mode='blocked';passages=[]
+            if debug_trace:
+                debug_trace.add("retrieved_context_safety", "Retrieved-context prompt-injection screen",
+                                status="blocked", details={"reason": "Potential prompt injection found in retrieved passage"})
             _flow_step(flow_trace,'Answer generation','Skipped because retrieved text was blocked','skipped')
         else:
             answer_start=time.perf_counter()
-            text,mode=answer(req.question,passages,history)
+            if debug_trace:
+                text,mode=answer(req.question,passages,history,debug_trace=debug_trace)
+            else:
+                text,mode=answer(req.question,passages,history)
             answer_component='app.generation.answer + OpenAI-compatible LLM API' if mode=='llm' else 'app.generation.answer (retrieval-only / abstention fallback)'
             answer_detail=f"Mode: {mode}"+(f"; model: {LLM_MODEL}" if mode=='llm' and LLM_MODEL else '')
             _flow_step(flow_trace,'Answer generation',answer_component,'called' if mode=='llm' else ('abstained' if mode=='no evidence' else 'fallback'),answer_start,detail=answer_detail)
+    if debug_trace:
+        debug_trace.add(
+            "response_ready", "FastAPI response serializer",
+            details={"answer_mode": mode, "final_evidence_count": len(passages),
+                     "total_request_elapsed_ms": round((time.perf_counter()-start)*1000, 1)},
+            data={"answer": text, "citations": [
+                {"document": p["document"], "page": p["page"], "type": p.get("content_type", p["kind"]),
+                 "score": p.get("score"), "asset_path": p.get("asset_path", ""),
+                 "file_path": p.get("file_path", ""), "latex": p.get("latex", "")}
+                for p in passages
+            ]},
+        )
     touch_session(session['id'],now);add_messages(session['id'],req.question,text,now)
     pii_start=time.perf_counter();pii_detected=sorted({c for p in passages for c in detect_pii(p['text'])})
     _flow_step(flow_trace,'PII pattern scan','app.guardrails.detect_pii (Python regex checks)','scanned',pii_start,detail=f"Detected categories: {', '.join(pii_detected) if pii_detected else 'none'}; detection only, no redaction")
     _flow_step(flow_trace,'Citations and response','FastAPI response serializer','complete',detail=f"{len(passages)} source citations prepared")
-    return {'answer':text,'sources':[{'document':p['document'],'document_id':p.get('document_id'),'chunk_id':p.get('chunk_id',p.get('id')),'page':p['page'],'kind':p['kind'],'content_type':p.get('content_type',p['kind']),'caption':p.get('caption',''),'section':p.get('section',''),'latex':p.get('latex',''),'score':round(p['score'],3),'excerpt':p['text'],'asset_name':Path(p['asset_path']).name if p.get('asset_path') else None} for p in passages], 'mode':mode,'agent_trace':agent_trace,'flow_trace':flow_trace,'pii_detected':pii_detected,'session_id':session['id'],'session_turns':session['turns']+1,'latency_seconds':round(time.perf_counter()-start,3)}
+    return {'answer':text,'sources':[{'document':p['document'],'document_id':p.get('document_id'),'chunk_id':p.get('chunk_id',p.get('id')),'page':p['page'],'kind':p['kind'],'content_type':p.get('content_type',p['kind']),'caption':p.get('caption',''),'section':p.get('section',''),'latex':p.get('latex',''),'score':round(p['score'],3),'excerpt':p['text'],'asset_name':Path(p['asset_path']).name if p.get('asset_path') else None} for p in passages], 'mode':mode,'agent_trace':agent_trace,'flow_trace':flow_trace,'debug_trace':debug_trace.events if debug_trace else [],'pii_detected':pii_detected,'session_id':session['id'],'session_turns':session['turns']+1,'latency_seconds':round(time.perf_counter()-start,3)}
